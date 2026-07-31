@@ -1,0 +1,229 @@
+package com.nolag.screenrecorder
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.media.MediaMuxer
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Environment
+import android.os.HandlerThread
+import android.os.IBinder
+import android.util.DisplayMetrics
+import androidx.core.app.NotificationCompat
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * Quay màn hình bằng cách ghi thẳng vào Surface đầu vào của MediaCodec (hardware encoder).
+ * Không copy bitmap qua CPU -> gần như không tốn thêm tải GPU/CPU của game.
+ * Toàn bộ việc "rút" dữ liệu đã encode chạy trên 1 HandlerThread riêng, tách khỏi main thread.
+ */
+class ScreenRecordService : Service() {
+
+    companion object {
+        const val ACTION_START = "com.nolag.screenrecorder.START"
+        const val ACTION_STOP = "com.nolag.screenrecorder.STOP"
+        const val EXTRA_RESULT_CODE = "extra_result_code"
+        const val EXTRA_RESULT_DATA = "extra_result_data"
+
+        private const val CHANNEL_ID = "screen_record_channel"
+        private const val NOTIF_ID = 1001
+
+        // Cấu hình quay - giữ đúng theo yêu cầu: 1080p @ 60fps
+        private const val VIDEO_WIDTH = 1920
+        private const val VIDEO_HEIGHT = 1080
+        private const val FRAME_RATE = 60
+        private const val BITRATE = 12_000_000 // 12 Mbps, VBR mặc định của encoder
+        private const val I_FRAME_INTERVAL = 2
+    }
+
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var encoder: MediaCodec? = null
+    private var muxer: MediaMuxer? = null
+    private var trackIndex = -1
+    private var muxerStarted = false
+
+    private lateinit var encoderThread: HandlerThread
+    private var draining = false
+
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            stopRecordingInternal()
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> {
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
+                @Suppress("DEPRECATION")
+                val resultData: Intent? = intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                if (resultData != null) {
+                    startForeground(NOTIF_ID, buildNotification())
+                    startRecording(resultCode, resultData)
+                }
+            }
+            ACTION_STOP -> {
+                stopRecordingInternal()
+                stopSelf()
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun buildNotification(): Notification {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID, "Ghi màn hình", NotificationManager.IMPORTANCE_LOW
+            )
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(channel)
+        }
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Đang quay màn hình")
+            .setContentText("1080p @ 60fps - hardware encoder")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun startRecording(resultCode: Int, resultData: Intent) {
+        val projectionManager =
+            getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
+        mediaProjection?.registerCallback(projectionCallback, null)
+
+        setupEncoder()
+        setupMuxer()
+
+        val dpi = resources.displayMetrics.densityDpi
+        val inputSurface = encoder!!.createInputSurface()
+
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "NoLagScreenRecord",
+            VIDEO_WIDTH, VIDEO_HEIGHT, dpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            inputSurface,
+            null, null
+        )
+
+        encoder?.start()
+        startDrainThread()
+    }
+
+    private fun setupEncoder() {
+        val format = MediaFormat.createVideoFormat(
+            MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT
+        ).apply {
+            setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            )
+            setInteger(MediaFormat.KEY_BIT_RATE, BITRATE)
+            setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
+        }
+        encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        }
+        // Lưu ý: createInputSurface() phải gọi SAU configure(), TRƯỚC start().
+        // Được gọi lại ở startRecording() qua encoder!!.createInputSurface()
+    }
+
+    private fun setupMuxer() {
+        val moviesDir = File(
+            getExternalFilesDir(Environment.DIRECTORY_MOVIES), "ScreenRecNoLag"
+        ).apply { mkdirs() }
+        val fileName = "rec_" +
+            SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
+        val outFile = File(moviesDir, fileName)
+        muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+    }
+
+    private fun startDrainThread() {
+        encoderThread = HandlerThread("EncoderDrainThread").apply { start() }
+        draining = true
+        val handler = android.os.Handler(encoderThread.looper)
+        handler.post(object : Runnable {
+            private val bufferInfo = MediaCodec.BufferInfo()
+            override fun run() {
+                if (!draining) return
+                val codec = encoder ?: return
+                val outIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)
+                when {
+                    outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        trackIndex = muxer!!.addTrack(codec.outputFormat)
+                        muxer!!.start()
+                        muxerStarted = true
+                    }
+                    outIndex >= 0 -> {
+                        val encodedData = codec.getOutputBuffer(outIndex)
+                        if (encodedData != null && muxerStarted &&
+                            bufferInfo.size > 0 &&
+                            (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
+                        ) {
+                            encodedData.position(bufferInfo.offset)
+                            encodedData.limit(bufferInfo.offset + bufferInfo.size)
+                            muxer!!.writeSampleData(trackIndex, encodedData, bufferInfo)
+                        }
+                        codec.releaseOutputBuffer(outIndex, false)
+                    }
+                }
+                if (draining) {
+                    handler.post(this)
+                }
+            }
+        })
+    }
+
+    private fun stopRecordingInternal() {
+        draining = false
+        try {
+            encoder?.signalEndOfInputStream()
+        } catch (_: Exception) {
+        }
+        try {
+            encoder?.stop()
+            encoder?.release()
+        } catch (_: Exception) {
+        }
+        try {
+            if (muxerStarted) {
+                muxer?.stop()
+            }
+            muxer?.release()
+        } catch (_: Exception) {
+        }
+        virtualDisplay?.release()
+        mediaProjection?.unregisterCallback(projectionCallback)
+        mediaProjection?.stop()
+        if (::encoderThread.isInitialized) {
+            encoderThread.quitSafely()
+        }
+        encoder = null
+        muxer = null
+        virtualDisplay = null
+        mediaProjection = null
+        stopForeground(STOP_FOREGROUND_REMOVE)
+    }
+
+    override fun onDestroy() {
+        stopRecordingInternal()
+        super.onDestroy()
+    }
+}
