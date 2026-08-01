@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.hardware.display.DisplayManager
@@ -14,11 +15,13 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.HandlerThread
 import android.os.IBinder
-import android.util.DisplayMetrics
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import java.io.File
 import java.text.SimpleDateFormat
@@ -58,6 +61,8 @@ class ScreenRecordService : Service() {
     private var muxer: MediaMuxer? = null
     private var trackIndex = -1
     private var muxerStarted = false
+    private var outputUri: Uri? = null
+    private var outputPfd: ParcelFileDescriptor? = null
 
     private lateinit var encoderThread: HandlerThread
     private val stopRequested = AtomicBoolean(false)
@@ -153,13 +158,35 @@ class ScreenRecordService : Service() {
     }
 
     private fun setupMuxer() {
-        val moviesDir = File(
-            getExternalFilesDir(Environment.DIRECTORY_MOVIES), "ScreenRecNoLag"
-        ).apply { mkdirs() }
         val fileName = "rec_" +
             SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
-        val outFile = File(moviesDir, fileName)
-        muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Android 10+: lưu qua MediaStore -> video hiện thẳng trong Gallery/Ảnh.
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(
+                    MediaStore.Video.Media.RELATIVE_PATH,
+                    Environment.DIRECTORY_MOVIES + "/ScreenRecNoLag"
+                )
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+            outputUri = uri
+            val pfd = contentResolver.openFileDescriptor(uri!!, "rw")
+            outputPfd = pfd
+            muxer = MediaMuxer(pfd!!.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        } else {
+            // Android cũ hơn (<10): ghi trực tiếp vào thư mục Movies công khai.
+            @Suppress("DEPRECATION")
+            val moviesDir = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+                "ScreenRecNoLag"
+            ).apply { mkdirs() }
+            val outFile = File(moviesDir, fileName)
+            muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        }
     }
 
     private fun startDrainThread() {
@@ -245,6 +272,20 @@ class ScreenRecordService : Service() {
         } catch (_: Exception) {
         }
         try {
+            outputPfd?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            val uri = outputUri
+            if (uri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.IS_PENDING, 0)
+                }
+                contentResolver.update(uri, values, null, null)
+            }
+        } catch (_: Exception) {
+        }
+        try {
             virtualDisplay?.release()
         } catch (_: Exception) {
         }
@@ -257,6 +298,8 @@ class ScreenRecordService : Service() {
         muxer = null
         virtualDisplay = null
         mediaProjection = null
+        outputUri = null
+        outputPfd = null
         stopLatch?.countDown()
         if (::encoderThread.isInitialized) {
             encoderThread.quitSafely()

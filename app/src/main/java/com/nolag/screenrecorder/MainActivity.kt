@@ -62,7 +62,7 @@ class MainActivity : AppCompatActivity() {
                 action = ScreenRecordService.ACTION_STOP
             }
             startService(stopIntent)
-            tvStatus.text = "Đã dừng. File lưu trong Movies/ScreenRecNoLag"
+            tvStatus.text = "Đã dừng. Video nằm trong Movies/ScreenRecNoLag (xem trong Gallery)"
             btnStart.isEnabled = true
             btnStop.isEnabled = false
         }
