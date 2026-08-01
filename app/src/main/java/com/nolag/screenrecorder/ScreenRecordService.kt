@@ -24,6 +24,9 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Quay màn hình bằng cách ghi thẳng vào Surface đầu vào của MediaCodec (hardware encoder).
@@ -57,7 +60,9 @@ class ScreenRecordService : Service() {
     private var muxerStarted = false
 
     private lateinit var encoderThread: HandlerThread
-    private var draining = false
+    private val stopRequested = AtomicBoolean(false)
+    private val alreadyStopped = AtomicBoolean(false)
+    private var stopLatch: CountDownLatch? = null
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -103,6 +108,8 @@ class ScreenRecordService : Service() {
     }
 
     private fun startRecording(resultCode: Int, resultData: Intent) {
+        muxerStarted = false
+        trackIndex = -1
         val projectionManager =
             getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
@@ -157,48 +164,73 @@ class ScreenRecordService : Service() {
 
     private fun startDrainThread() {
         encoderThread = HandlerThread("EncoderDrainThread").apply { start() }
-        draining = true
+        stopRequested.set(false)
+        alreadyStopped.set(false)
         val handler = android.os.Handler(encoderThread.looper)
         handler.post(object : Runnable {
             private val bufferInfo = MediaCodec.BufferInfo()
             override fun run() {
-                if (!draining) return
-                val codec = encoder ?: return
-                val outIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)
-                when {
-                    outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        trackIndex = muxer!!.addTrack(codec.outputFormat)
-                        muxer!!.start()
-                        muxerStarted = true
-                    }
-                    outIndex >= 0 -> {
-                        val encodedData = codec.getOutputBuffer(outIndex)
-                        if (encodedData != null && muxerStarted &&
-                            bufferInfo.size > 0 &&
-                            (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
-                        ) {
-                            encodedData.position(bufferInfo.offset)
-                            encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                            muxer!!.writeSampleData(trackIndex, encodedData, bufferInfo)
-                        }
-                        codec.releaseOutputBuffer(outIndex, false)
-                    }
+                val codec = encoder
+                if (codec == null) {
+                    finishTeardown()
+                    return
                 }
-                if (draining) {
+                try {
+                    val outIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)
+                    when {
+                        outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            trackIndex = muxer!!.addTrack(codec.outputFormat)
+                            muxer!!.start()
+                            muxerStarted = true
+                        }
+                        outIndex >= 0 -> {
+                            val encodedData = codec.getOutputBuffer(outIndex)
+                            if (encodedData != null && muxerStarted &&
+                                bufferInfo.size > 0 &&
+                                (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
+                            ) {
+                                encodedData.position(bufferInfo.offset)
+                                encodedData.limit(bufferInfo.offset + bufferInfo.size)
+                                muxer!!.writeSampleData(trackIndex, encodedData, bufferInfo)
+                            }
+                            codec.releaseOutputBuffer(outIndex, false)
+                        }
+                    }
+
+                    val isEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                    if (isEos) {
+                        // Đã nhận đủ dữ liệu cuối cùng -> dọn dẹp ngay tại đây, cùng 1 luồng.
+                        finishTeardown()
+                        return
+                    }
+                } catch (e: Exception) {
+                    // Nếu codec bị lỗi/đã đóng, dừng vòng lặp an toàn thay vì crash app.
+                    finishTeardown()
+                    return
+                }
+
+                if (!stopRequested.get()) {
+                    handler.post(this)
+                } else {
+                    // Đã yêu cầu dừng nhưng chưa thấy EOS (vd EOS bị timeout) -> thử vài lần rồi buộc dọn dẹp.
                     handler.post(this)
                 }
             }
         })
     }
 
-    private fun stopRecordingInternal() {
-        draining = false
+    /**
+     * Dọn dẹp toàn bộ tài nguyên (encoder, muxer, virtual display, projection).
+     * QUAN TRỌNG: hàm này chỉ được gọi từ encoderThread để tránh 2 luồng cùng
+     * đụng vào MediaCodec/MediaMuxer một lúc (nguyên nhân gây crash khi bấm dừng).
+     */
+    private fun finishTeardown() {
+        if (!alreadyStopped.compareAndSet(false, true)) return
         try {
-            encoder?.signalEndOfInputStream()
+            encoder?.stop()
         } catch (_: Exception) {
         }
         try {
-            encoder?.stop()
             encoder?.release()
         } catch (_: Exception) {
         }
@@ -206,19 +238,48 @@ class ScreenRecordService : Service() {
             if (muxerStarted) {
                 muxer?.stop()
             }
+        } catch (_: Exception) {
+        }
+        try {
             muxer?.release()
         } catch (_: Exception) {
         }
-        virtualDisplay?.release()
-        mediaProjection?.unregisterCallback(projectionCallback)
-        mediaProjection?.stop()
-        if (::encoderThread.isInitialized) {
-            encoderThread.quitSafely()
+        try {
+            virtualDisplay?.release()
+        } catch (_: Exception) {
+        }
+        try {
+            mediaProjection?.unregisterCallback(projectionCallback)
+            mediaProjection?.stop()
+        } catch (_: Exception) {
         }
         encoder = null
         muxer = null
         virtualDisplay = null
         mediaProjection = null
+        stopLatch?.countDown()
+        if (::encoderThread.isInitialized) {
+            encoderThread.quitSafely()
+        }
+    }
+
+    private fun stopRecordingInternal() {
+        if (stopRequested.getAndSet(true)) return // đã yêu cầu dừng rồi, tránh gọi trùng
+        val latch = CountDownLatch(1)
+        stopLatch = latch
+        try {
+            encoder?.signalEndOfInputStream()
+        } catch (_: Exception) {
+            // Nếu báo EOS thất bại (vd codec đã lỗi), buộc dọn dẹp ngay trên encoderThread.
+            if (::encoderThread.isInitialized) {
+                android.os.Handler(encoderThread.looper).post { finishTeardown() }
+            } else {
+                finishTeardown()
+            }
+        }
+        // Đợi tối đa 3 giây để encoderThread tự dọn dẹp xong, tránh main thread đụng
+        // vào MediaCodec/MediaMuxer cùng lúc với encoderThread (nguyên nhân gây crash).
+        latch.await(3, TimeUnit.SECONDS)
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
