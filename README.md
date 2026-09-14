@@ -27,14 +27,18 @@ mà các app quay replay chuyên game vẫn dùng.
 
 | Thông số | Giá trị |
 |---|---|
-| Độ phân giải | 1080 x 2400 |
+| Độ phân giải | Tự động lấy theo màn hình thực tế **tại thời điểm bấm "Bắt đầu quay"** (nên bấm quay khi game đã mở và đã xoay ngang) |
 | FPS | 60 |
 | Bitrate | 10 Mbps |
 | Keyframe interval | 2s |
 | Cửa sổ buffer | 90 giây |
 
-Máy yếu hơn/pin yếu: giảm `VIDEO_WIDTH/HEIGHT` xuống 720p hoặc bitrate xuống
-6-8Mbps.
+Máy yếu hơn/pin yếu: giảm `VIDEO_BITRATE` xuống 6-8Mbps.
+
+**Lưu ý quan trọng về thứ tự thao tác** (đúc kết từ thực tế test trên Redmi K70E):
+1. **Mở Liên Quân Mobile trước**, để máy xoay ngang và game đã có "cửa sổ" đang chạy.
+2. Sau đó mới mở Game Replay Recorder → bấm "Bắt đầu quay" → chọn **"Share one app" → Liên Quân Mobile**.
+3. Nếu bấm quay trước khi mở game, chế độ "share one app" sẽ không có gì để gắn vào → quay không ra gì (không phải do bug, mà do Android yêu cầu app đích phải đang chạy sẵn cho kiểu chia sẻ này).
 
 ## Cách dùng
 

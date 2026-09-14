@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
 import android.view.WindowManager
@@ -44,8 +45,6 @@ class ScreenCaptureService : Service() {
         const val EXTRA_RESULT_DATA = "result_data"
 
         // Tunables — adjust for device/game.
-        private const val VIDEO_WIDTH = 1080
-        private const val VIDEO_HEIGHT = 2400
         private const val VIDEO_BITRATE = 10_000_000
         private const val VIDEO_FRAME_RATE = 60
         private const val VIDEO_I_FRAME_INTERVAL_SEC = 2
@@ -116,9 +115,34 @@ class ScreenCaptureService : Service() {
         return START_STICKY
     }
 
+    private var videoWidth = 0
+    private var videoHeight = 0
+
+    /**
+     * Reads the screen's *current* real size, already reflecting whatever
+     * orientation is active right now (e.g. landscape, because the game
+     * forced it). Hardcoding a portrait resolution here was the cause of
+     * landscape game footage being squeezed/letterboxed into a portrait frame.
+     */
+    private fun captureCurrentScreenSize(): Pair<Int, Int> {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(metrics)
+        // Encoders generally require even dimensions.
+        val w = metrics.widthPixels - (metrics.widthPixels % 2)
+        val h = metrics.heightPixels - (metrics.heightPixels % 2)
+        return w to h
+    }
+
     private fun startPipeline() {
+        val (w, h) = captureCurrentScreenSize()
+        videoWidth = w
+        videoHeight = h
+        Log.i(TAG, "Capturing at current screen size: ${videoWidth}x${videoHeight}")
+
         val format = MediaFormat.createVideoFormat(
-            MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT
+            MediaFormat.MIMETYPE_VIDEO_AVC, videoWidth, videoHeight
         ).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, VIDEO_BITRATE)
@@ -178,12 +202,12 @@ class ScreenCaptureService : Service() {
 
         virtualDisplay = mediaProjection!!.createVirtualDisplay(
             "GameReplayCapture",
-            VIDEO_WIDTH, VIDEO_HEIGHT, resources.displayMetrics.densityDpi,
+            videoWidth, videoHeight, resources.displayMetrics.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             inputSurface, null, encoderHandler
         )
 
-        Log.i(TAG, "Capture pipeline started: ${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FRAME_RATE}fps")
+        Log.i(TAG, "Capture pipeline started: ${videoWidth}x${videoHeight}@${VIDEO_FRAME_RATE}fps")
     }
 
     /** Small floating button so the user can save a highlight without leaving the game. */
