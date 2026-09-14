@@ -28,7 +28,7 @@ class MainActivity : AppCompatActivity() {
                     putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, result.data)
                 }
                 ContextCompat.startForegroundService(this, intent)
-                Toast.makeText(this, "Đang quay... mở game và chơi bình thường", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Đã sẵn sàng — mở game rồi chạm nút BẮT ĐẦU nổi trên màn hình", Toast.LENGTH_LONG).show()
             } else {
                 Toast.makeText(this, "Bạn cần cho phép quay màn hình", Toast.LENGTH_SHORT).show()
             }
@@ -63,7 +63,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val recordBtn = Button(this).apply {
-            text = "2) Bắt đầu quay (rolling buffer 90s)"
+            text = "2) Cấp quyền quay màn hình"
             setOnClickListener { startCapture() }
         }
 
@@ -73,9 +73,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         val hint = TextView(this).apply {
-            text = "Sau khi bắt đầu quay: mở Liên Quân, chơi bình thường. " +
-                "Khi vừa có pha hay, chạm nút nổi \"SAVE\" ở góc màn hình " +
-                "để lưu 90 giây gần nhất thành video vào Movies/GameReplay."
+            text = "Sau bước 2, sẽ có 1 nút nổi \"BẮT ĐẦU\" trên màn hình (chưa quay gì cả). " +
+                "Bạn mở Liên Quân, chơi bình thường, ĐẾN LÚC ĐANG Ở TRONG GAME (đã xoay ngang) " +
+                "mới chạm nút \"BẮT ĐẦU\" — lúc đó việc quay mới thực sự bắt đầu, đúng khung ngang. " +
+                "Sau đó nút đổi thành \"SAVE\": chạm khi vừa có pha hay để lưu 90 giây gần nhất " +
+                "vào Movies/GameReplay."
             setPadding(0, 32, 0, 0)
         }
 

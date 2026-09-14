@@ -36,18 +36,24 @@ mà các app quay replay chuyên game vẫn dùng.
 Máy yếu hơn/pin yếu: giảm `VIDEO_BITRATE` xuống 6-8Mbps.
 
 **Lưu ý quan trọng về thứ tự thao tác** (đúc kết từ thực tế test trên Redmi K70E):
-1. **Mở Liên Quân Mobile trước**, để máy xoay ngang và game đã có "cửa sổ" đang chạy.
-2. Sau đó mới mở Game Replay Recorder → bấm "Bắt đầu quay" → chọn **"Share one app" → Liên Quân Mobile**.
-3. Nếu bấm quay trước khi mở game, chế độ "share one app" sẽ không có gì để gắn vào → quay không ra gì (không phải do bug, mà do Android yêu cầu app đích phải đang chạy sẵn cho kiểu chia sẻ này).
+1. Bấm "Cấp quyền quay màn hình" và chọn **"Share one app" → Liên Quân Mobile** (game nên đang chạy sẵn).
+2. **Không quay ngay** — chỉ có nút nổi "BẮT ĐẦU" chờ sẵn.
+3. Vào hẳn trong game, đợi máy xoay ngang.
+4. Chạm "BẮT ĐẦU" **trong lúc đang ở trong game** — đây mới là lúc pipeline thực sự khởi tạo theo đúng kích thước ngang.
 
 ## Cách dùng
 
 1. Mở app → bấm **"Cấp quyền hiển thị nổi"**, cho phép overlay.
-2. Bấm **"Bắt đầu quay"**, cho phép quay màn hình khi hệ thống hỏi.
-3. Mở Liên Quân Mobile, chơi bình thường — sẽ thấy 1 nút nhỏ **SAVE** nổi ở góc màn hình.
-4. Khi vừa có pha hay (pentakill, outplay...), chạm **SAVE** → video 90 giây gần nhất
+2. Bấm **"Cấp quyền quay màn hình"**, cho phép khi hệ thống hỏi (chọn **Share one app → Liên Quân Mobile** — game phải đang chạy sẵn ở bước này nếu bạn đã mở nó trước).
+3. Lúc này sẽ có **1 nút nổi "BẮT ĐẦU"** hiện trên màn hình — **chưa quay gì cả**, chỉ là chờ.
+4. Mở/chuyển vào Liên Quân Mobile, chơi bình thường cho đến khi máy đã xoay ngang hẳn.
+5. **Ngay lúc đang ở trong game**, chạm nút nổi **"BẮT ĐẦU"** — lúc này việc quay mới thực sự bắt đầu, dùng đúng kích thước màn hình ngang tại thời điểm đó. Nút đổi thành **"SAVE"**.
+6. Khi vừa có pha hay (pentakill, outplay...), chạm **SAVE** → video 90 giây gần nhất
    được lưu vào `Movies/GameReplay/`.
-5. Kéo file đó vào CapCut/editor để cắt/ghép rồi đăng TikTok.
+7. Kéo file đó vào CapCut/editor để cắt/ghép rồi đăng TikTok.
+
+**Vì sao phải bấm "BẮT ĐẦU" bên trong game thay vì tự động quay ngay khi cấp quyền?**
+Vì lúc bạn đang ở app này để cấp quyền, máy còn đang dọc — nếu quay ngay lúc đó, video sẽ bị quay theo khung dọc rồi kẹt luôn dù sau đó bạn mới xoay ngang vào game. Tách thành 2 bước (cấp quyền trước, bấm "BẮT ĐẦU" sau khi đã ở trong game) đảm bảo lúc pipeline thực sự khởi tạo, màn hình đã đúng hướng ngang.
 
 ## Giới hạn hiện tại (có thể mở rộng thêm)
 

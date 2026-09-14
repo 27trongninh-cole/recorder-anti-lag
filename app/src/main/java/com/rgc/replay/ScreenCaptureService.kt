@@ -18,6 +18,7 @@ import android.os.IBinder
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
+import android.view.Surface
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.Toast
@@ -25,14 +26,28 @@ import androidx.core.app.NotificationCompat
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Foreground service that owns the whole capture pipeline:
+ * Foreground service that owns the whole capture pipeline.
+ *
+ * Two-phase flow (this is the key fix for orientation issues):
+ *
+ *   Phase 1 (onStartCommand): only shows a floating "BẮT ĐẦU" button.
+ *   No VirtualDisplay/encoder is created yet — the MediaProjection grant is
+ *   just held onto. This lets the user switch into the game first.
+ *
+ *   Phase 2 (user taps "BẮT ĐẦU" while inside the game, already landscape):
+ *   *now* we read the screen size/rotation and build the actual pipeline:
  *
  *   MediaProjection -> VirtualDisplay -> MediaCodec input Surface (HW encoder)
  *      -> encoder output drained on a dedicated thread -> RollingBuffer (RAM)
  *
+ * Reading screen size at tap-time (rather than at service-start-time) avoids
+ * the problem where the phone is still portrait when the service starts
+ * (because you're in this app, not the game yet) even though the game will
+ * be landscape a moment later.
+ *
  * No frame ever touches a Bitmap and nothing is written to disk while playing.
- * A small floating button lets the user dump the last N seconds to an mp4
- * whenever they want (see HighlightMuxer).
+ * After phase 2 starts, the same floating button becomes "SAVE", dumping the
+ * last N seconds to an mp4 on tap (see HighlightMuxer).
  */
 class ScreenCaptureService : Service() {
 
@@ -64,6 +79,10 @@ class ScreenCaptureService : Service() {
     private var outputFormat: MediaFormat? = null
     private val rollingBuffer = RollingBuffer(BUFFER_WINDOW_SECONDS * 1_000_000L)
     private val isSaving = AtomicBoolean(false)
+    private val pipelineStarted = AtomicBoolean(false)
+
+    private var videoWidth = 0
+    private var videoHeight = 0
 
     private var windowManager: WindowManager? = null
     private var overlayView: Button? = null
@@ -100,13 +119,13 @@ class ScreenCaptureService : Service() {
                 }
             }, Handler(mainLooper))
 
-            startPipeline()
+            // Phase 1 only: show the button, do NOT start the pipeline yet.
             showOverlayButton()
             isRunning = true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start capture pipeline", e)
+            Log.e(TAG, "Failed to prepare capture", e)
             Handler(mainLooper).post {
-                Toast.makeText(this, "Lỗi khởi động quay: ${e.message}", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Lỗi khởi động: ${e.message}", Toast.LENGTH_LONG).show()
             }
             stopSelf()
             return START_NOT_STICKY
@@ -115,24 +134,35 @@ class ScreenCaptureService : Service() {
         return START_STICKY
     }
 
-    private var videoWidth = 0
-    private var videoHeight = 0
-
     /**
-     * Reads the screen's *current* real size, already reflecting whatever
-     * orientation is active right now (e.g. landscape, because the game
-     * forced it). Hardcoding a portrait resolution here was the cause of
-     * landscape game footage being squeezed/letterboxed into a portrait frame.
+     * Reads the screen's current size AND explicitly checks the current
+     * rotation, then swaps width/height to match if they disagree.
+     *
+     * Called at button-tap time (inside the game), not at service-start
+     * time, so it reflects the orientation that actually matters.
      */
     private fun captureCurrentScreenSize(): Pair<Int, Int> {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val display = wm.defaultDisplay
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
-        wm.defaultDisplay.getRealMetrics(metrics)
-        // Encoders generally require even dimensions.
-        val w = metrics.widthPixels - (metrics.widthPixels % 2)
-        val h = metrics.heightPixels - (metrics.heightPixels % 2)
-        return w to h
+        display.getRealMetrics(metrics)
+
+        var w = metrics.widthPixels
+        var h = metrics.heightPixels
+        val rotation = display.rotation
+        val isLandscapeRotation = rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
+
+        val currentlyLandscape = w > h
+        if (isLandscapeRotation != currentlyLandscape) {
+            val t = w; w = h; h = t
+        }
+
+        Log.i(TAG, "rotation=$rotation metrics=${metrics.widthPixels}x${metrics.heightPixels} -> using ${w}x$h")
+
+        val evenW = w - (w % 2)
+        val evenH = h - (h % 2)
+        return evenW to evenH
     }
 
     private fun startPipeline() {
@@ -210,7 +240,28 @@ class ScreenCaptureService : Service() {
         Log.i(TAG, "Capture pipeline started: ${videoWidth}x${videoHeight}@${VIDEO_FRAME_RATE}fps")
     }
 
-    /** Small floating button so the user can save a highlight without leaving the game. */
+    /** Handles the single floating button, whose role changes depending on phase. */
+    private fun onOverlayButtonTapped() {
+        if (!pipelineStarted.get()) {
+            try {
+                startPipeline()
+                pipelineStarted.set(true)
+                overlayView?.text = "SAVE"
+                Toast.makeText(
+                    this,
+                    "Đang quay ${videoWidth}x${videoHeight} (buffer ${BUFFER_WINDOW_SECONDS}s)",
+                    Toast.LENGTH_LONG
+                ).show()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start pipeline on tap", e)
+                Toast.makeText(this, "Lỗi khi bắt đầu quay: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        } else {
+            saveHighlight()
+        }
+    }
+
+    /** Small floating button: "BẮT ĐẦU" before recording starts, then "SAVE". */
     private fun showOverlayButton() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
@@ -234,16 +285,18 @@ class ScreenCaptureService : Service() {
         }
 
         overlayView = Button(this).apply {
-            text = "SAVE"
+            text = "BẮT ĐẦU"
             setBackgroundColor(Color.parseColor("#CC1976D2"))
             setTextColor(Color.WHITE)
-            setOnClickListener { saveHighlight() }
+            setOnClickListener { onOverlayButtonTapped() }
         }
 
         windowManager?.addView(overlayView, params)
-        Handler(mainLooper).post {
-            Toast.makeText(this, "Đang quay (buffer ${BUFFER_WINDOW_SECONDS}s) — chạm SAVE khi có highlight", Toast.LENGTH_LONG).show()
-        }
+        Toast.makeText(
+            this,
+            "Vào game trước, rồi chạm nút BẮT ĐẦU để bắt đầu quay",
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     private fun saveHighlight() {
@@ -284,8 +337,8 @@ class ScreenCaptureService : Service() {
                 .createNotificationChannel(channel)
         }
         return NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
-            .setContentTitle("Đang ghi replay")
-            .setContentText("Chạm nút SAVE để lưu highlight vừa xảy ra")
+            .setContentTitle("Game Replay Recorder")
+            .setContentText("Chạm nút nổi để bắt đầu quay / lưu highlight")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
             .build()
