@@ -90,9 +90,29 @@ class ScreenCaptureService : Service() {
         }
 
         mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, resultData)
-        startPipeline()
-        showOverlayButton()
-        isRunning = true
+
+        try {
+            // Required since Android 14 (API 34): MediaProjection.createVirtualDisplay()
+            // throws IllegalStateException if no callback is registered first.
+            mediaProjection!!.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Log.i(TAG, "MediaProjection stopped by system/user")
+                    stopSelf()
+                }
+            }, Handler(mainLooper))
+
+            startPipeline()
+            showOverlayButton()
+            isRunning = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start capture pipeline", e)
+            Handler(mainLooper).post {
+                Toast.makeText(this, "Lỗi khởi động quay: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         return START_STICKY
     }
 
@@ -197,6 +217,9 @@ class ScreenCaptureService : Service() {
         }
 
         windowManager?.addView(overlayView, params)
+        Handler(mainLooper).post {
+            Toast.makeText(this, "Đang quay (buffer ${BUFFER_WINDOW_SECONDS}s) — chạm SAVE khi có highlight", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun saveHighlight() {
