@@ -117,13 +117,23 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIF_ID, buildNotification())
+        // IMPORTANT: on Android 14+, startForeground() with type
+        // FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION throws a SecurityException
+        // if a MediaProjection hasn't been granted yet ("Media projection
+        // permission not granted"). Since the bubble now shows *before* the
+        // user has granted screen-capture permission, this phase must start
+        // as a plain "specialUse" foreground service instead — the service
+        // is re-promoted to the mediaProjection type later, right when
+        // mediaProjection is actually obtained (see requestProjectionThenStart()).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIF_ID, buildNotification(),
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(NOTIF_ID, buildNotification())
+        }
 
-        // No MediaProjection is requested here anymore. The service only
-        // needs the overlay permission to show the bubble; screen-capture
-        // permission is requested lazily on the bubble's first tap (see
-        // requestProjectionThenStart()) — this is what lets "grant overlay"
-        // and "grant screen recording" be two fully separate steps.
         if (bubbleView == null) {
             showBubble()
             isRunning = true
@@ -290,6 +300,12 @@ class ScreenCaptureService : Service() {
             if (resultCode == Activity.RESULT_OK && data != null) {
                 try {
                     mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        startForeground(
+                            NOTIF_ID, buildNotification(),
+                            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                        )
+                    }
                     mediaProjection!!.registerCallback(object : MediaProjection.Callback() {
                         override fun onStop() {
                             Log.i(TAG, "MediaProjection stopped by system/user")

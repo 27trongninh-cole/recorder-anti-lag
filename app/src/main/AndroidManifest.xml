@@ -35,7 +35,11 @@
         <service
             android:name=".ScreenCaptureService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:foregroundServiceType="specialUse|mediaProjection">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="floating_gesture_bubble_awaiting_capture_permission" />
+        </service>
 
     </application>
 </manifest>
