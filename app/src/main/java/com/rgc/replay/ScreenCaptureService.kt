@@ -177,10 +177,19 @@ class ScreenCaptureService : Service() {
                     stopSelf()
                 }
             }, Handler(mainLooper))
-            toast("Đã cấp quyền — chạm bong bóng lần nữa để bắt đầu quay")
+
+            // Must start using the projection immediately — Android 14 revokes
+            // a granted MediaProjection if the app doesn't actually capture
+            // with it right away (e.g. while waiting for a second, separate
+            // tap on the bubble). So permission-grant and recording-start are
+            // now one step, not two.
+            startPipeline()
+            setState(BubbleState.RECORDING)
+            vibrate(40)
+            toast("Đang quay ${videoWidth}x${videoHeight} — chạm để đánh dấu khoảnh khắc")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to prepare capture", e)
-            toast("Lỗi khi xin quyền quay: ${e.message}")
+            toast("Lỗi khi bắt đầu quay: ${e.message}")
         }
     }
 
@@ -309,15 +318,19 @@ class ScreenCaptureService : Service() {
         when (bubbleState) {
             BubbleState.IDLE -> {
                 if (mediaProjection == null) {
-                    // First tap ever (or after permission was revoked): ask for
-                    // screen-recording permission via the invisible relay activity.
-                    // The NEXT tap (once granted) is what actually starts recording.
+                    // Ask for screen-recording permission via the invisible relay
+                    // activity. Recording now starts automatically the moment
+                    // permission is granted (see handleCaptureResult) — Android 14
+                    // revokes the permission if it isn't used right away, so we
+                    // can no longer wait for a separate second tap here.
                     startActivity(
                         Intent(this, CaptureConsentActivity::class.java)
                             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     )
                     return
                 }
+                // Fallback path: permission already held (e.g. a previous auto-start
+                // failed) — retry starting the pipeline directly.
                 try {
                     startPipeline()
                     setState(BubbleState.RECORDING)

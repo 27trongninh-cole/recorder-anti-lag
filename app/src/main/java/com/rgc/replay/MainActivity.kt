@@ -61,8 +61,8 @@ class MainActivity : AppCompatActivity() {
 
         val hint = TextView(this).apply {
             text = "Sau khi bong bóng hiện ra, mọi thao tác đều qua nó:\n" +
-                "• Chạm lần 1 (khi vào game rồi): xin quyền quay màn hình\n" +
-                "• Chạm lần 2: bắt đầu quay / các lần sau: đánh dấu khoảnh khắc\n" +
+                "• Chạm lần đầu (khi đã vào game): xin quyền quay màn hình → quay luôn\n" +
+                "• Các lần chạm sau (khi đang quay): đánh dấu khoảnh khắc\n" +
                 "• Vuốt trái: tạm dừng / tiếp tục\n" +
                 "• Vuốt phải: dừng quay, xuất tất cả khoảnh khắc đã đánh dấu\n" +
                 "• Vuốt lên: chọn thời lượng lưu (15/30/60/90s)\n" +
