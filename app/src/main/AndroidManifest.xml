@@ -25,6 +25,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ProjectionRequestActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <service
             android:name=".ScreenCaptureService"
             android:exported="false"

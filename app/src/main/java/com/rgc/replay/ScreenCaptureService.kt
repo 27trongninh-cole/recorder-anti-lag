@@ -55,9 +55,6 @@ class ScreenCaptureService : Service() {
         private const val NOTIF_CHANNEL_ID = "replay_capture"
         private const val NOTIF_ID = 1001
 
-        const val EXTRA_RESULT_CODE = "result_code"
-        const val EXTRA_RESULT_DATA = "result_data"
-
         private const val VIDEO_BITRATE = 10_000_000
         private const val VIDEO_FRAME_RATE = 60
         private const val VIDEO_I_FRAME_INTERVAL_SEC = 2
@@ -120,36 +117,16 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent == null) return START_NOT_STICKY
-
         startForeground(NOTIF_ID, buildNotification())
 
-        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
-        val resultData = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
-
-        if (resultCode == Activity.RESULT_CANCELED || resultData == null) {
-            Log.e(TAG, "Missing screen capture permission result, stopping.")
-            stopSelf()
-            return START_NOT_STICKY
-        }
-
-        mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, resultData)
-
-        try {
-            mediaProjection!!.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() {
-                    Log.i(TAG, "MediaProjection stopped by system/user")
-                    stopSelf()
-                }
-            }, Handler(mainLooper))
-
+        // No MediaProjection is requested here anymore. The service only
+        // needs the overlay permission to show the bubble; screen-capture
+        // permission is requested lazily on the bubble's first tap (see
+        // requestProjectionThenStart()) — this is what lets "grant overlay"
+        // and "grant screen recording" be two fully separate steps.
+        if (bubbleView == null) {
             showBubble()
             isRunning = true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to prepare capture", e)
-            toast("Lỗi khởi động: ${e.message}")
-            stopSelf()
-            return START_NOT_STICKY
         }
 
         return START_STICKY
@@ -279,20 +256,59 @@ class ScreenCaptureService : Service() {
     private fun onTap() {
         when (bubbleState) {
             BubbleState.IDLE -> {
-                try {
-                    startPipeline()
-                    setState(BubbleState.RECORDING)
-                    vibrate(40)
-                    toast("Đang quay ${videoWidth}x${videoHeight} — chạm để đánh dấu khoảnh khắc")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to start pipeline", e)
-                    toast("Lỗi khi bắt đầu quay: ${e.message}")
+                if (mediaProjection == null) {
+                    requestProjectionThenStart()
+                } else {
+                    startPipelineAndRecord()
                 }
             }
             BubbleState.RECORDING -> markMoment()
             BubbleState.PAUSED -> toast("Đang tạm dừng — vuốt trái để tiếp tục")
             BubbleState.DOCKED -> undock()
         }
+    }
+
+    private fun startPipelineAndRecord() {
+        try {
+            startPipeline()
+            setState(BubbleState.RECORDING)
+            vibrate(40)
+            toast("Đang quay ${videoWidth}x${videoHeight} — chạm để đánh dấu khoảnh khắc")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start pipeline", e)
+            toast("Lỗi khi bắt đầu quay: ${e.message}")
+        }
+    }
+
+    /**
+     * Fires only on the bubble's very first tap. Launches the transparent
+     * ProjectionRequestActivity to show the system screen-recording consent
+     * dialog, then resumes here with the result via ProjectionPermissionBridge.
+     */
+    private fun requestProjectionThenStart() {
+        ProjectionPermissionBridge.await { resultCode, data ->
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                try {
+                    mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
+                    mediaProjection!!.registerCallback(object : MediaProjection.Callback() {
+                        override fun onStop() {
+                            Log.i(TAG, "MediaProjection stopped by system/user")
+                            stopSelf()
+                        }
+                    }, Handler(mainLooper))
+                    startPipelineAndRecord()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to prepare capture", e)
+                    toast("Lỗi khởi động: ${e.message}")
+                }
+            } else {
+                toast("Cần cho phép quay màn hình thì mới bắt đầu quay được")
+            }
+        }
+        startActivity(
+            Intent(this, ProjectionRequestActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
     }
 
     private fun markMoment() {
@@ -551,7 +567,7 @@ class ScreenCaptureService : Service() {
         bubbleView = view
         bubbleParams = params
 
-        toast("Chạm bong bóng khi đã ở trong game để bắt đầu quay")
+        toast("Vào game rồi chạm bong bóng để xin quyền quay & bắt đầu")
     }
 
     private fun handleTouch(event: MotionEvent): Boolean {
