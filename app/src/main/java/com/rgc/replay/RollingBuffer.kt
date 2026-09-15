@@ -27,9 +27,15 @@ data class EncodedFrame(
  * This is intentionally an in-memory buffer (no disk I/O while "recording"),
  * which is what avoids the continuous-write overhead that causes long-session lag.
  */
-class RollingBuffer(private val windowUs: Long) {
+class RollingBuffer(@Volatile private var windowUs: Long) {
 
     private val frames = ConcurrentLinkedDeque<EncodedFrame>()
+
+    /** Lets the user change the "last N seconds" window at runtime (15/30/60/90s picker). */
+    fun setWindowUs(newWindowUs: Long) {
+        windowUs = newWindowUs
+        trim()
+    }
 
     fun add(frame: EncodedFrame) {
         frames.addLast(frame)

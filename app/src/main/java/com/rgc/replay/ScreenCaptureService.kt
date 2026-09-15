@@ -15,39 +15,39 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.Surface
+import android.view.VelocityTracker
 import android.view.WindowManager
-import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 
 /**
- * Foreground service that owns the whole capture pipeline.
+ * Foreground service owning: capture pipeline (MediaProjection -> VirtualDisplay
+ * -> MediaCodec HW encoder -> RollingBuffer in RAM) + the single floating
+ * gesture bubble that drives the whole session.
  *
- * Two-phase flow (this is the key fix for orientation issues):
- *
- *   Phase 1 (onStartCommand): only shows a floating "BẮT ĐẦU" button.
- *   No VirtualDisplay/encoder is created yet — the MediaProjection grant is
- *   just held onto. This lets the user switch into the game first.
- *
- *   Phase 2 (user taps "BẮT ĐẦU" while inside the game, already landscape):
- *   *now* we read the screen size/rotation and build the actual pipeline:
- *
- *   MediaProjection -> VirtualDisplay -> MediaCodec input Surface (HW encoder)
- *      -> encoder output drained on a dedicated thread -> RollingBuffer (RAM)
- *
- * Reading screen size at tap-time (rather than at service-start-time) avoids
- * the problem where the phone is still portrait when the service starts
- * (because you're in this app, not the game yet) even though the game will
- * be landscape a moment later.
- *
- * No frame ever touches a Bitmap and nothing is written to disk while playing.
- * After phase 2 starts, the same floating button becomes "SAVE", dumping the
- * last N seconds to an mp4 on tap (see HighlightMuxer).
+ * Bubble gestures (finalized design):
+ *  - Tap                 : IDLE    -> start the session (init pipeline now, at
+ *                                      whatever screen orientation is live —
+ *                                      this is what fixes the landscape/portrait bug)
+ *                           RECORDING -> mark a moment (bookmark; no file written yet)
+ *                           PAUSED  -> no-op (buffer frozen, nothing to mark)
+ *                           DOCKED  -> just undock, first tap doesn't trigger the action above
+ *  - Swipe left (fling)  : pause / resume the rolling buffer
+ *  - Swipe right (fling) : stop the session -> batch-export all marked moments to mp4
+ *  - Swipe up (fling)    : toggle the duration picker (15/30/60/90s)
+ *  - Swipe down (fling)  : dock the bubble to the nearest screen edge
+ *  - Slow drag           : freely reposition the bubble (e.g. to avoid covering skills)
  */
 class ScreenCaptureService : Service() {
 
@@ -59,15 +59,21 @@ class ScreenCaptureService : Service() {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
 
-        // Tunables — adjust for device/game.
         private const val VIDEO_BITRATE = 10_000_000
         private const val VIDEO_FRAME_RATE = 60
         private const val VIDEO_I_FRAME_INTERVAL_SEC = 2
-        private const val BUFFER_WINDOW_SECONDS = 90L
+
+        private val DURATION_OPTIONS_SEC = listOf(15L, 30L, 60L, 90L)
+        private const val DEFAULT_DURATION_INDEX = 1 // 30s
+
+        private const val FLING_VELOCITY_THRESHOLD = 900f // px/sec
+        private const val TAP_SLOP_PX = 16f
 
         @Volatile
         var isRunning = false
     }
+
+    private enum class BubbleState { IDLE, RECORDING, PAUSED, DOCKED }
 
     private lateinit var mediaProjectionManager: MediaProjectionManager
     private var mediaProjection: MediaProjection? = null
@@ -77,20 +83,35 @@ class ScreenCaptureService : Service() {
     private var encoderHandler: Handler? = null
 
     private var outputFormat: MediaFormat? = null
-    private val rollingBuffer = RollingBuffer(BUFFER_WINDOW_SECONDS * 1_000_000L)
-    private val isSaving = AtomicBoolean(false)
-    private val pipelineStarted = AtomicBoolean(false)
+    private var rollingBuffer: RollingBuffer? = null
+    private lateinit var momentStore: MomentStore
+    private val isBusy = AtomicBoolean(false) // guards marking/exporting from overlapping
 
     private var videoWidth = 0
     private var videoHeight = 0
+    private var durationIndex = DEFAULT_DURATION_INDEX
+
+    private var bubbleState = BubbleState.IDLE
+    private var stateBeforeDock = BubbleState.IDLE
 
     private var windowManager: WindowManager? = null
-    private var overlayView: Button? = null
+    private var bubbleView: BubbleView? = null
+    private var bubbleParams: WindowManager.LayoutParams? = null
+    private var pickerView: LinearLayout? = null
+    private var pickerParams: WindowManager.LayoutParams? = null
+
+    // touch tracking
+    private var velocityTracker: VelocityTracker? = null
+    private var downRawX = 0f
+    private var downRawY = 0f
+    private var downLayoutX = 0
+    private var downLayoutY = 0
 
     override fun onCreate() {
         super.onCreate()
         mediaProjectionManager =
             getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        momentStore = MomentStore(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -110,8 +131,6 @@ class ScreenCaptureService : Service() {
         mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, resultData)
 
         try {
-            // Required since Android 14 (API 34): MediaProjection.createVirtualDisplay()
-            // throws IllegalStateException if no callback is registered first.
             mediaProjection!!.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
                     Log.i(TAG, "MediaProjection stopped by system/user")
@@ -119,14 +138,11 @@ class ScreenCaptureService : Service() {
                 }
             }, Handler(mainLooper))
 
-            // Phase 1 only: show the button, do NOT start the pipeline yet.
-            showOverlayButton()
+            showBubble()
             isRunning = true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to prepare capture", e)
-            Handler(mainLooper).post {
-                Toast.makeText(this, "Lỗi khởi động: ${e.message}", Toast.LENGTH_LONG).show()
-            }
+            toast("Lỗi khởi động: ${e.message}")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -134,13 +150,11 @@ class ScreenCaptureService : Service() {
         return START_STICKY
     }
 
-    /**
-     * Reads the screen's current size AND explicitly checks the current
-     * rotation, then swaps width/height to match if they disagree.
-     *
-     * Called at button-tap time (inside the game), not at service-start
-     * time, so it reflects the orientation that actually matters.
-     */
+    // ---------------------------------------------------------------------
+    // Screen size (read at the moment recording actually starts, not at
+    // service-start time — this is what avoids the portrait/landscape bug)
+    // ---------------------------------------------------------------------
+
     private fun captureCurrentScreenSize(): Pair<Int, Int> {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val display = wm.defaultDisplay
@@ -152,24 +166,25 @@ class ScreenCaptureService : Service() {
         var h = metrics.heightPixels
         val rotation = display.rotation
         val isLandscapeRotation = rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
-
         val currentlyLandscape = w > h
         if (isLandscapeRotation != currentlyLandscape) {
             val t = w; w = h; h = t
         }
-
-        Log.i(TAG, "rotation=$rotation metrics=${metrics.widthPixels}x${metrics.heightPixels} -> using ${w}x$h")
 
         val evenW = w - (w % 2)
         val evenH = h - (h % 2)
         return evenW to evenH
     }
 
+    // ---------------------------------------------------------------------
+    // Pipeline
+    // ---------------------------------------------------------------------
+
     private fun startPipeline() {
         val (w, h) = captureCurrentScreenSize()
         videoWidth = w
         videoHeight = h
-        Log.i(TAG, "Capturing at current screen size: ${videoWidth}x${videoHeight}")
+        rollingBuffer = RollingBuffer(DURATION_OPTIONS_SEC[durationIndex] * 1_000_000L)
 
         val format = MediaFormat.createVideoFormat(
             MediaFormat.MIMETYPE_VIDEO_AVC, videoWidth, videoHeight
@@ -181,34 +196,29 @@ class ScreenCaptureService : Service() {
         }
 
         encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-
         encoderThread = HandlerThread("EncoderCallbackThread").also { it.start() }
         encoderHandler = Handler(encoderThread!!.looper)
 
         encoder!!.setCallback(object : MediaCodec.Callback() {
-            override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-                // Not used: input comes from the Surface, not from us.
-            }
+            override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {}
 
-            override fun onOutputBufferAvailable(
-                codec: MediaCodec,
-                index: Int,
-                info: MediaCodec.BufferInfo
-            ) {
+            override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
                 try {
-                    val buffer = codec.getOutputBuffer(index)
-                    if (buffer != null && info.size > 0) {
-                        val bytes = ByteArray(info.size)
-                        buffer.position(info.offset)
-                        buffer.get(bytes, 0, info.size)
-                        rollingBuffer.add(
-                            EncodedFrame(
-                                data = bytes,
-                                presentationTimeUs = info.presentationTimeUs,
-                                flags = info.flags,
-                                isKeyFrame = rollingBuffer.isKeyFrame(info)
+                    if (bubbleState != BubbleState.PAUSED) {
+                        val buffer = codec.getOutputBuffer(index)
+                        if (buffer != null && info.size > 0) {
+                            val bytes = ByteArray(info.size)
+                            buffer.position(info.offset)
+                            buffer.get(bytes, 0, info.size)
+                            rollingBuffer?.add(
+                                EncodedFrame(
+                                    data = bytes,
+                                    presentationTimeUs = info.presentationTimeUs,
+                                    flags = info.flags,
+                                    isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                                )
                             )
-                        )
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error draining encoder output", e)
@@ -237,95 +247,331 @@ class ScreenCaptureService : Service() {
             inputSurface, null, encoderHandler
         )
 
-        Log.i(TAG, "Capture pipeline started: ${videoWidth}x${videoHeight}@${VIDEO_FRAME_RATE}fps")
+        Log.i(TAG, "Pipeline started: ${videoWidth}x${videoHeight}@${VIDEO_FRAME_RATE}fps, window=${DURATION_OPTIONS_SEC[durationIndex]}s")
     }
 
-    /** Handles the single floating button, whose role changes depending on phase. */
-    private fun onOverlayButtonTapped() {
-        if (!pipelineStarted.get()) {
-            try {
-                startPipeline()
-                pipelineStarted.set(true)
-                overlayView?.text = "SAVE"
-                Toast.makeText(
-                    this,
-                    "Đang quay ${videoWidth}x${videoHeight} (buffer ${BUFFER_WINDOW_SECONDS}s)",
-                    Toast.LENGTH_LONG
-                ).show()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start pipeline on tap", e)
-                Toast.makeText(this, "Lỗi khi bắt đầu quay: ${e.message}", Toast.LENGTH_LONG).show()
+    private fun teardownPipeline() {
+        try {
+            virtualDisplay?.release()
+            encoder?.stop()
+            encoder?.release()
+            encoderThread?.quitSafely()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error tearing down pipeline", e)
+        }
+        virtualDisplay = null
+        encoder = null
+        encoderThread = null
+        encoderHandler = null
+        outputFormat = null
+        rollingBuffer = null
+    }
+
+    // ---------------------------------------------------------------------
+    // Gesture actions
+    // ---------------------------------------------------------------------
+
+    private fun onTap() {
+        when (bubbleState) {
+            BubbleState.IDLE -> {
+                try {
+                    startPipeline()
+                    setState(BubbleState.RECORDING)
+                    vibrate(40)
+                    toast("Đang quay ${videoWidth}x${videoHeight} — chạm để đánh dấu khoảnh khắc")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to start pipeline", e)
+                    toast("Lỗi khi bắt đầu quay: ${e.message}")
+                }
             }
-        } else {
-            saveHighlight()
+            BubbleState.RECORDING -> markMoment()
+            BubbleState.PAUSED -> toast("Đang tạm dừng — vuốt trái để tiếp tục")
+            BubbleState.DOCKED -> undock()
         }
     }
 
-    /** Small floating button: "BẮT ĐẦU" before recording starts, then "SAVE". */
-    private fun showOverlayButton() {
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+    private fun markMoment() {
+        if (!isBusy.compareAndSet(false, true)) return
+        val buffer = rollingBuffer
+        if (buffer == null) {
+            isBusy.set(false)
+            return
+        }
+        Thread {
+            try {
+                val snapshot = buffer.snapshot()
+                val ok = momentStore.addMark(snapshot)
+                Handler(mainLooper).post {
+                    if (ok) {
+                        vibrate(30); vibrate(30) // two short pulses = bookmark
+                        toast("Đã đánh dấu khoảnh khắc #${momentStore.count}")
+                    } else {
+                        toast("Chưa có gì để đánh dấu")
+                    }
+                }
+            } finally {
+                isBusy.set(false)
+            }
+        }.start()
+    }
 
-        val overlayType =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                WindowManager.LayoutParams.TYPE_PHONE
+    private fun togglePauseResume() {
+        when (bubbleState) {
+            BubbleState.RECORDING -> {
+                setState(BubbleState.PAUSED)
+                vibrate(40)
+                toast("Đã tạm dừng buffer")
+            }
+            BubbleState.PAUSED -> {
+                setState(BubbleState.RECORDING)
+                vibrate(40)
+                toast("Đã tiếp tục quay")
+            }
+            else -> { /* no-op when idle/docked */ }
+        }
+    }
+
+    private fun stopSession() {
+        if (bubbleState == BubbleState.IDLE) {
+            // Nothing recorded yet — just close the bubble entirely.
+            stopSelf()
+            return
+        }
+        if (!isBusy.compareAndSet(false, true)) return
+
+        val format = outputFormat
+        vibrate(120)
+        toast("Đang xuất ${momentStore.count} khoảnh khắc...")
+
+        Thread {
+            try {
+                val exported = if (format != null) momentStore.exportAll(format) else 0
+                Handler(mainLooper).post {
+                    toast(
+                        if (exported > 0) "Đã lưu $exported video vào Movies/GameReplay"
+                        else "Không có khoảnh khắc nào được lưu"
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Export failed", e)
+                Handler(mainLooper).post { toast("Lỗi khi xuất video") }
+            } finally {
+                isBusy.set(false)
+                teardownPipeline()
+                Handler(mainLooper).post { stopSelf() }
+            }
+        }.start()
+    }
+
+    private fun dock() {
+        if (bubbleState == BubbleState.DOCKED) return
+        stateBeforeDock = bubbleState
+        val params = bubbleParams ?: return
+        val wm = windowManager ?: return
+        val metrics = resources.displayMetrics
+        val goRight = params.x + (bubbleView?.width ?: 0) / 2 > metrics.widthPixels / 2
+        params.x = if (goRight) metrics.widthPixels - dp(20) else -dp(36)
+        wm.updateViewLayout(bubbleView, params)
+        bubbleState = BubbleState.DOCKED
+        bubbleView?.state = BubbleView.VisualState.DOCKED
+        hidePicker()
+    }
+
+    private fun undock() {
+        val params = bubbleParams ?: return
+        val wm = windowManager ?: return
+        val metrics = resources.displayMetrics
+        val goRight = params.x > metrics.widthPixels / 2
+        params.x = if (goRight) metrics.widthPixels - dp(80) else dp(20)
+        wm.updateViewLayout(bubbleView, params)
+        setState(stateBeforeDock)
+    }
+
+    private fun setState(newState: BubbleState) {
+        bubbleState = newState
+        bubbleView?.state = when (newState) {
+            BubbleState.IDLE -> BubbleView.VisualState.IDLE
+            BubbleState.RECORDING -> BubbleView.VisualState.RECORDING
+            BubbleState.PAUSED -> BubbleView.VisualState.PAUSED
+            BubbleState.DOCKED -> BubbleView.VisualState.DOCKED
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Duration picker (shown on swipe-up). Simplified for this first pass:
+    // a row of 4 tappable labels rather than a full drag-to-select slider —
+    // functionally equivalent (pick one of 4 fixed values), just less fancy.
+    // ---------------------------------------------------------------------
+
+    private fun togglePicker() {
+        if (pickerView != null) {
+            hidePicker()
+        } else {
+            showPicker()
+        }
+    }
+
+    private fun showPicker() {
+        val wm = windowManager ?: return
+        val bp = bubbleParams ?: return
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.parseColor("#DD202020"))
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        DURATION_OPTIONS_SEC.forEachIndexed { i, seconds ->
+            val label = TextView(this).apply {
+                text = "${seconds}s"
+                setTextColor(if (i == durationIndex) Color.parseColor("#FF64B5F6") else Color.WHITE)
+                textSize = 16f
+                setPadding(dp(16), dp(4), dp(16), dp(4))
+                setOnClickListener {
+                    durationIndex = i
+                    rollingBuffer?.setWindowUs(seconds * 1_000_000L)
+                    toast("Đã chọn lưu $seconds giây gần nhất")
+                    hidePicker()
+                }
+            }
+            row.addView(label)
+        }
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = 20
-            y = 200
+            gravity = Gravity.TOP or Gravity.START
+            x = bp.x
+            y = (bp.y - dp(56)).coerceAtLeast(0)
         }
 
-        overlayView = Button(this).apply {
-            text = "BẮT ĐẦU"
-            setBackgroundColor(Color.parseColor("#CC1976D2"))
-            setTextColor(Color.WHITE)
-            setOnClickListener { onOverlayButtonTapped() }
-        }
-
-        windowManager?.addView(overlayView, params)
-        Toast.makeText(
-            this,
-            "Vào game trước, rồi chạm nút BẮT ĐẦU để bắt đầu quay",
-            Toast.LENGTH_LONG
-        ).show()
+        wm.addView(row, params)
+        pickerView = row
+        pickerParams = params
     }
 
-    private fun saveHighlight() {
-        if (!isSaving.compareAndSet(false, true)) return
+    private fun hidePicker() {
+        pickerView?.let { windowManager?.removeView(it) }
+        pickerView = null
+        pickerParams = null
+    }
 
-        val format = outputFormat
-        if (format == null) {
-            Toast.makeText(this, "Chưa sẵn sàng, thử lại sau vài giây", Toast.LENGTH_SHORT).show()
-            isSaving.set(false)
-            return
+    // ---------------------------------------------------------------------
+    // Bubble view + gesture detection
+    // ---------------------------------------------------------------------
+
+    private fun overlayType() =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else
+            WindowManager.LayoutParams.TYPE_PHONE
+
+    private fun showBubble() {
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val metrics = resources.displayMetrics
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = metrics.widthPixels - dp(80)
+            y = dp(200)
         }
 
-        Thread {
-            try {
-                val snapshot = rollingBuffer.snapshot()
-                val file = HighlightMuxer.save(snapshot, format)
-                Handler(mainLooper).post {
-                    val msg = if (file != null) "Đã lưu: ${file.name}" else "Chưa có gì để lưu"
-                    Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to save highlight", e)
-                Handler(mainLooper).post {
-                    Toast.makeText(this, "Lỗi khi lưu highlight", Toast.LENGTH_LONG).show()
-                }
-            } finally {
-                isSaving.set(false)
+        val view = BubbleView(this)
+        view.setOnTouchListener { _, event -> handleTouch(event) }
+
+        windowManager?.addView(view, params)
+        bubbleView = view
+        bubbleParams = params
+
+        toast("Chạm bong bóng khi đã ở trong game để bắt đầu quay")
+    }
+
+    private fun handleTouch(event: MotionEvent): Boolean {
+        val params = bubbleParams ?: return false
+        val wm = windowManager ?: return false
+
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                velocityTracker?.recycle()
+                velocityTracker = VelocityTracker.obtain()
+                velocityTracker?.addMovement(event)
+                downRawX = event.rawX
+                downRawY = event.rawY
+                downLayoutX = params.x
+                downLayoutY = params.y
+                return true
             }
-        }.start()
+            MotionEvent.ACTION_MOVE -> {
+                velocityTracker?.addMovement(event)
+                val dx = (event.rawX - downRawX).toInt()
+                val dy = (event.rawY - downRawY).toInt()
+                if (bubbleState != BubbleState.DOCKED) {
+                    params.x = downLayoutX + dx
+                    params.y = downLayoutY + dy
+                    wm.updateViewLayout(bubbleView, params)
+                }
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                val vt = velocityTracker
+                vt?.addMovement(event)
+                vt?.computeCurrentVelocity(1000)
+                val vx = vt?.xVelocity ?: 0f
+                val vy = vt?.yVelocity ?: 0f
+                vt?.recycle()
+                velocityTracker = null
+
+                val dx = event.rawX - downRawX
+                val dy = event.rawY - downRawY
+                val moved = abs(dx) > TAP_SLOP_PX || abs(dy) > TAP_SLOP_PX
+                val speed = maxOf(abs(vx), abs(vy))
+
+                when {
+                    !moved -> onTap()
+                    speed > FLING_VELOCITY_THRESHOLD -> {
+                        if (abs(vx) > abs(vy)) {
+                            if (vx < 0) togglePauseResume() else stopSession()
+                        } else {
+                            if (vy < 0) togglePicker() else dock()
+                        }
+                    }
+                    // else: was a slow drag — leave the bubble wherever it was moved to.
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun toast(msg: String) {
+        Handler(mainLooper).post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+    }
+
+    private fun vibrate(ms: Long) {
+        try {
+            val vib = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vib.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                vib.vibrate(ms)
+            }
+        } catch (_: Exception) {}
     }
 
     private fun buildNotification(): Notification {
@@ -338,7 +584,7 @@ class ScreenCaptureService : Service() {
         }
         return NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
             .setContentTitle("Game Replay Recorder")
-            .setContentText("Chạm nút nổi để bắt đầu quay / lưu highlight")
+            .setContentText("Chạm / vuốt bong bóng nổi để điều khiển")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
             .build()
@@ -348,20 +594,13 @@ class ScreenCaptureService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        hidePicker()
         try {
-            overlayView?.let { windowManager?.removeView(it) }
+            bubbleView?.let { windowManager?.removeView(it) }
         } catch (_: Exception) {}
-
-        try {
-            virtualDisplay?.release()
-            encoder?.stop()
-            encoder?.release()
-            encoderThread?.quitSafely()
-            mediaProjection?.stop()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during cleanup", e)
-        }
-        rollingBuffer.clear()
+        teardownPipeline()
+        momentStore.clear()
+        mediaProjection?.stop()
         super.onDestroy()
     }
 }

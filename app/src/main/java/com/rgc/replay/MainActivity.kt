@@ -28,7 +28,7 @@ class MainActivity : AppCompatActivity() {
                     putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, result.data)
                 }
                 ContextCompat.startForegroundService(this, intent)
-                Toast.makeText(this, "Đã sẵn sàng — mở game rồi chạm nút BẮT ĐẦU nổi trên màn hình", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Bong bóng đã hiện — vào game rồi chạm để bắt đầu quay", Toast.LENGTH_LONG).show()
             } else {
                 Toast.makeText(this, "Bạn cần cho phép quay màn hình", Toast.LENGTH_SHORT).show()
             }
@@ -63,21 +63,24 @@ class MainActivity : AppCompatActivity() {
         }
 
         val recordBtn = Button(this).apply {
-            text = "2) Cấp quyền quay màn hình"
+            text = "2) Cấp quyền quay màn hình → hiện bong bóng"
             setOnClickListener { startCapture() }
         }
 
         val stopBtn = Button(this).apply {
-            text = "Dừng quay"
+            text = "Đóng app quay (chỉ khi không đang quay)"
             setOnClickListener { stopCapture() }
         }
 
         val hint = TextView(this).apply {
-            text = "Sau bước 2, sẽ có 1 nút nổi \"BẮT ĐẦU\" trên màn hình (chưa quay gì cả). " +
-                "Bạn mở Liên Quân, chơi bình thường, ĐẾN LÚC ĐANG Ở TRONG GAME (đã xoay ngang) " +
-                "mới chạm nút \"BẮT ĐẦU\" — lúc đó việc quay mới thực sự bắt đầu, đúng khung ngang. " +
-                "Sau đó nút đổi thành \"SAVE\": chạm khi vừa có pha hay để lưu 90 giây gần nhất " +
-                "vào Movies/GameReplay."
+            text = "Sau bước 2 sẽ hiện 1 bong bóng tròn nổi:\n" +
+                "• Chạm: bắt đầu quay (lần đầu) / đánh dấu khoảnh khắc (khi đang quay)\n" +
+                "• Vuốt trái: tạm dừng / tiếp tục\n" +
+                "• Vuốt phải: dừng quay, xuất tất cả khoảnh khắc đã đánh dấu\n" +
+                "• Vuốt lên: chọn thời lượng lưu (15/30/60/90s)\n" +
+                "• Vuốt xuống: dính bong bóng vào cạnh màn hình\n" +
+                "• Kéo chậm: di chuyển bong bóng tránh đè nút/tướng\n\n" +
+                "Video chỉ được lưu khi bạn vuốt phải để dừng quay — vào Movies/GameReplay."
             setPadding(0, 32, 0, 0)
         }
 
