@@ -4,6 +4,7 @@ import android.app.*
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
@@ -27,6 +28,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
@@ -126,19 +128,34 @@ class ScreenCaptureService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) return START_NOT_STICKY
-        startForeground(NOTIF_ID, buildNotification())
 
         when (intent.action) {
-            ACTION_CAPTURE_RESULT -> handleCaptureResult(intent)
+            ACTION_CAPTURE_RESULT -> {
+                // Must declare the mediaProjection FGS type BEFORE calling
+                // getMediaProjection() below, or Android 14 throws a
+                // SecurityException (this is what crashed before).
+                startForegroundAs(ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                handleCaptureResult(intent)
+            }
             else -> {
-                // ACTION_SHOW_BUBBLE, or no action at all (first launch from MainActivity):
-                // just make sure the bubble is on screen. No capture permission needed yet —
-                // that's asked for later, from the bubble's own first tap.
+                // ACTION_SHOW_BUBBLE, or no action at all: just show the
+                // bubble. No capture permission yet, so this must NOT use
+                // the mediaProjection FGS type — that alone caused the
+                // crash on Android 14+ when tapping the launcher button.
+                startForegroundAs(ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
                 showBubble()
                 isRunning = true
             }
         }
         return START_STICKY
+    }
+
+    private fun startForegroundAs(type: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(), type)
+        } else {
+            startForeground(NOTIF_ID, buildNotification())
+        }
     }
 
     /** Called after CaptureConsentActivity relays back what the user chose. */
