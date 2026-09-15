@@ -55,6 +55,14 @@ class ScreenCaptureService : Service() {
         private const val NOTIF_CHANNEL_ID = "replay_capture"
         private const val NOTIF_ID = 1001
 
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val EXTRA_RESULT_DATA = "result_data"
+
+        /** Sent by MainActivity: just show the bubble, no capture permission yet. */
+        const val ACTION_SHOW_BUBBLE = "com.rgc.replay.action.SHOW_BUBBLE"
+        /** Sent by CaptureConsentActivity: relays the screen-capture consent result. */
+        const val ACTION_CAPTURE_RESULT = "com.rgc.replay.action.CAPTURE_RESULT"
+
         private const val VIDEO_BITRATE = 10_000_000
         private const val VIDEO_FRAME_RATE = 60
         private const val VIDEO_I_FRAME_INTERVAL_SEC = 2
@@ -96,8 +104,8 @@ class ScreenCaptureService : Service() {
     private var bubbleParams: WindowManager.LayoutParams? = null
     private var pickerView: LinearLayout? = null
     private var pickerParams: WindowManager.LayoutParams? = null
-    private var petalView: PetalMenuView? = null
-    private var petalParams: WindowManager.LayoutParams? = null
+    private var radialBannerView: RadialBannerView? = null
+    private var radialBannerParams: WindowManager.LayoutParams? = null
 
     // touch tracking
     private var downRawX = 0f
@@ -117,29 +125,46 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // IMPORTANT: on Android 14+, startForeground() with type
-        // FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION throws a SecurityException
-        // if a MediaProjection hasn't been granted yet ("Media projection
-        // permission not granted"). Since the bubble now shows *before* the
-        // user has granted screen-capture permission, this phase must start
-        // as a plain "specialUse" foreground service instead — the service
-        // is re-promoted to the mediaProjection type later, right when
-        // mediaProjection is actually obtained (see requestProjectionThenStart()).
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIF_ID, buildNotification(),
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            startForeground(NOTIF_ID, buildNotification())
-        }
+        if (intent == null) return START_NOT_STICKY
+        startForeground(NOTIF_ID, buildNotification())
 
-        if (bubbleView == null) {
-            showBubble()
-            isRunning = true
+        when (intent.action) {
+            ACTION_CAPTURE_RESULT -> handleCaptureResult(intent)
+            else -> {
+                // ACTION_SHOW_BUBBLE, or no action at all (first launch from MainActivity):
+                // just make sure the bubble is on screen. No capture permission needed yet —
+                // that's asked for later, from the bubble's own first tap.
+                showBubble()
+                isRunning = true
+            }
         }
-
         return START_STICKY
+    }
+
+    /** Called after CaptureConsentActivity relays back what the user chose. */
+    private fun handleCaptureResult(intent: Intent) {
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+        val resultData = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+
+        if (resultCode == Activity.RESULT_CANCELED || resultData == null) {
+            toast("Bạn cần cấp quyền quay màn hình")
+            return
+        }
+
+        try {
+            mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, resultData)
+            mediaProjection!!.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Log.i(TAG, "MediaProjection stopped by system/user")
+                    mediaProjection = null
+                    stopSelf()
+                }
+            }, Handler(mainLooper))
+            toast("Đã cấp quyền — chạm bong bóng lần nữa để bắt đầu quay")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to prepare capture", e)
+            toast("Lỗi khi xin quyền quay: ${e.message}")
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -267,64 +292,29 @@ class ScreenCaptureService : Service() {
         when (bubbleState) {
             BubbleState.IDLE -> {
                 if (mediaProjection == null) {
-                    requestProjectionThenStart()
-                } else {
-                    startPipelineAndRecord()
+                    // First tap ever (or after permission was revoked): ask for
+                    // screen-recording permission via the invisible relay activity.
+                    // The NEXT tap (once granted) is what actually starts recording.
+                    startActivity(
+                        Intent(this, CaptureConsentActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                    return
+                }
+                try {
+                    startPipeline()
+                    setState(BubbleState.RECORDING)
+                    vibrate(40)
+                    toast("Đang quay ${videoWidth}x${videoHeight} — chạm để đánh dấu khoảnh khắc")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to start pipeline", e)
+                    toast("Lỗi khi bắt đầu quay: ${e.message}")
                 }
             }
             BubbleState.RECORDING -> markMoment()
             BubbleState.PAUSED -> toast("Đang tạm dừng — vuốt trái để tiếp tục")
             BubbleState.DOCKED -> undock()
         }
-    }
-
-    private fun startPipelineAndRecord() {
-        try {
-            startPipeline()
-            setState(BubbleState.RECORDING)
-            vibrate(40)
-            toast("Đang quay ${videoWidth}x${videoHeight} — chạm để đánh dấu khoảnh khắc")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start pipeline", e)
-            toast("Lỗi khi bắt đầu quay: ${e.message}")
-        }
-    }
-
-    /**
-     * Fires only on the bubble's very first tap. Launches the transparent
-     * ProjectionRequestActivity to show the system screen-recording consent
-     * dialog, then resumes here with the result via ProjectionPermissionBridge.
-     */
-    private fun requestProjectionThenStart() {
-        ProjectionPermissionBridge.await { resultCode, data ->
-            if (resultCode == Activity.RESULT_OK && data != null) {
-                try {
-                    mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                        startForeground(
-                            NOTIF_ID, buildNotification(),
-                            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                        )
-                    }
-                    mediaProjection!!.registerCallback(object : MediaProjection.Callback() {
-                        override fun onStop() {
-                            Log.i(TAG, "MediaProjection stopped by system/user")
-                            stopSelf()
-                        }
-                    }, Handler(mainLooper))
-                    startPipelineAndRecord()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to prepare capture", e)
-                    toast("Lỗi khởi động: ${e.message}")
-                }
-            } else {
-                toast("Cần cho phép quay màn hình thì mới bắt đầu quay được")
-            }
-        }
-        startActivity(
-            Intent(this, ProjectionRequestActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
     }
 
     private fun markMoment() {
@@ -497,20 +487,17 @@ class ScreenCaptureService : Service() {
     }
 
     // ---------------------------------------------------------------------
-    // Petal menu: shown the instant a swipe is detected, gives visual
+    // Radial banner: shown the instant a swipe is detected, gives visual
     // feedback for the currently-selected direction, lets the user change
-    // direction before releasing.
+    // direction before releasing. Fixed at top-middle of the screen —
+    // does NOT track the bubble's position (design v2).
     // ---------------------------------------------------------------------
 
-    private fun showPetalMenu() {
+    private fun showRadialBanner() {
         val wm = windowManager ?: return
-        val bp = bubbleParams ?: return
-        if (petalView != null) return
+        if (radialBannerView != null) return
 
-        val view = PetalMenuView(this)
-        val menuSize = dp(PetalMenuView.SIZE_DP)
-        val bubbleSize = dp(BubbleView.SIZE_DP)
-
+        val view = RadialBannerView(this)
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -518,36 +505,35 @@ class ScreenCaptureService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            // Center the (larger) petal menu on the bubble's current center.
-            x = bp.x - (menuSize - bubbleSize) / 2
-            y = bp.y - (menuSize - bubbleSize) / 2
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            x = 0
+            y = 0
         }
 
         wm.addView(view, params)
-        petalView = view
-        petalParams = params
+        radialBannerView = view
+        radialBannerParams = params
     }
 
-    private fun updatePetalDirection(dx: Float, dy: Float) {
+    private fun updateRadialDirection(dx: Float, dy: Float) {
         val swipeThresholdPx = dp(SWIPE_MIN_DISTANCE_DP)
         val dir = if (maxOf(abs(dx), abs(dy)) < swipeThresholdPx) {
-            PetalMenuView.Direction.NONE
+            RadialBannerView.Direction.NONE
         } else if (abs(dx) > abs(dy)) {
-            if (dx < 0) PetalMenuView.Direction.LEFT else PetalMenuView.Direction.RIGHT
+            if (dx < 0) RadialBannerView.Direction.LEFT else RadialBannerView.Direction.RIGHT
         } else {
-            if (dy < 0) PetalMenuView.Direction.UP else PetalMenuView.Direction.DOWN
+            if (dy < 0) RadialBannerView.Direction.UP else RadialBannerView.Direction.DOWN
         }
-        petalView?.highlighted = dir
+        radialBannerView?.highlighted = dir
     }
 
-    private fun currentPetalDirection(): PetalMenuView.Direction =
-        petalView?.highlighted ?: PetalMenuView.Direction.NONE
+    private fun currentRadialDirection(): RadialBannerView.Direction =
+        radialBannerView?.highlighted ?: RadialBannerView.Direction.NONE
 
-    private fun hidePetalMenu() {
-        petalView?.let { windowManager?.removeView(it) }
-        petalView = null
-        petalParams = null
+    private fun hideRadialBanner() {
+        radialBannerView?.let { windowManager?.removeView(it) }
+        radialBannerView = null
+        radialBannerParams = null
     }
 
     // ---------------------------------------------------------------------
@@ -561,6 +547,8 @@ class ScreenCaptureService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
 
     private fun showBubble() {
+        if (bubbleView != null) return // already showing — avoid a duplicate overlay view
+
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val metrics = resources.displayMetrics
 
@@ -583,7 +571,7 @@ class ScreenCaptureService : Service() {
         bubbleView = view
         bubbleParams = params
 
-        toast("Vào game rồi chạm bong bóng để xin quyền quay & bắt đầu")
+        toast("Vào game rồi chạm bong bóng để xin quyền quay màn hình")
     }
 
     private fun handleTouch(event: MotionEvent): Boolean {
@@ -627,18 +615,19 @@ class ScreenCaptureService : Service() {
                     if (abs(dx) > TAP_SLOP_PX || abs(dy) > TAP_SLOP_PX) {
                         longPressRunnable?.let { longPressHandler.removeCallbacks(it) }
                         isSelectingGesture = true
-                        showPetalMenu()
+                        showRadialBanner()
                         vibrate(10)
                     } else {
                         return true
                     }
                 }
 
-                // In gesture-selection mode: just update which petal is
-                // highlighted based on the current finger position — the
-                // bubble itself does NOT move, so this can never be mistaken
-                // for dragging. The user can freely change direction here.
-                updatePetalDirection(dx, dy)
+                // In gesture-selection mode: just update which slice of the
+                // (fixed-position) radial banner is highlighted based on the
+                // current finger position — the bubble itself does NOT move,
+                // so this can never be mistaken for dragging. The user can
+                // freely change direction here.
+                updateRadialDirection(dx, dy)
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -650,15 +639,15 @@ class ScreenCaptureService : Service() {
                 }
 
                 if (isSelectingGesture) {
-                    val dir = currentPetalDirection()
-                    hidePetalMenu()
+                    val dir = currentRadialDirection()
+                    hideRadialBanner()
                     isSelectingGesture = false
                     when (dir) {
-                        PetalMenuView.Direction.LEFT -> togglePauseResume()
-                        PetalMenuView.Direction.RIGHT -> stopSession()
-                        PetalMenuView.Direction.UP -> togglePicker()
-                        PetalMenuView.Direction.DOWN -> dock()
-                        PetalMenuView.Direction.NONE -> onTap() // released back in the dead zone
+                        RadialBannerView.Direction.LEFT -> togglePauseResume()
+                        RadialBannerView.Direction.RIGHT -> stopSession()
+                        RadialBannerView.Direction.UP -> togglePicker()
+                        RadialBannerView.Direction.DOWN -> dock()
+                        RadialBannerView.Direction.NONE -> onTap() // released back in the dead zone
                     }
                     return true
                 }
@@ -715,7 +704,7 @@ class ScreenCaptureService : Service() {
         isRunning = false
         longPressRunnable?.let { longPressHandler.removeCallbacks(it) }
         hidePicker()
-        hidePetalMenu()
+        hideRadialBanner()
         try {
             bubbleView?.let { windowManager?.removeView(it) }
         } catch (_: Exception) {}

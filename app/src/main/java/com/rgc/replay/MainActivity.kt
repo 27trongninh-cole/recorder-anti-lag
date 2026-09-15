@@ -14,7 +14,17 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 
+/**
+ * The only screen the user ever sees. One button, two possible taps:
+ *  - overlay permission not granted yet -> tap sends them to the system
+ *    permission screen.
+ *  - overlay permission already granted -> tap starts the bubble service
+ *    and closes this app immediately. Screen-recording permission is asked
+ *    for later, from the bubble itself (see ScreenCaptureService.onTap()).
+ */
 class MainActivity : AppCompatActivity() {
+
+    private lateinit var startBtn: Button
 
     private val notifPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* no-op */ }
@@ -22,6 +32,15 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(buildUi())
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshButtonLabel()
     }
 
     private fun buildUi(): LinearLayout {
@@ -36,90 +55,51 @@ class MainActivity : AppCompatActivity() {
             textSize = 20f
         }
 
-        val overlayBtn = Button(this).apply {
-            text = "1) Cấp quyền hiển thị nổi (overlay)"
-            setOnClickListener { requestOverlayPermissionIfNeeded() }
-        }
-
-        val bubbleBtn = Button(this).apply {
-            text = "2) Hiện bong bóng nổi"
-            setOnClickListener { showBubbleOnly() }
-        }
-
-        val stopBtn = Button(this).apply {
-            text = "Đóng app quay (chỉ khi không đang quay)"
-            setOnClickListener { stopCapture() }
+        startBtn = Button(this).apply {
+            setOnClickListener { onStartClicked() }
         }
 
         val hint = TextView(this).apply {
-            text = "Bước 2 chỉ hiện bong bóng, CHƯA xin quyền quay màn hình.\n" +
-                "Quyền quay màn hình chỉ được hỏi khi bạn CHẠM bong bóng lần đầu " +
-                "(nên vào game trước rồi mới chạm, để pipeline đọc đúng kích thước " +
-                "màn hình lúc đó).\n\n" +
-                "Sau khi bong bóng hiện lên:\n" +
-                "• Chạm lần đầu: xin quyền quay màn hình → bắt đầu quay\n" +
-                "• Chạm khi đang quay: đánh dấu khoảnh khắc\n" +
+            text = "Sau khi bong bóng hiện ra, mọi thao tác đều qua nó:\n" +
+                "• Chạm lần 1 (khi vào game rồi): xin quyền quay màn hình\n" +
+                "• Chạm lần 2: bắt đầu quay / các lần sau: đánh dấu khoảnh khắc\n" +
                 "• Vuốt trái: tạm dừng / tiếp tục\n" +
                 "• Vuốt phải: dừng quay, xuất tất cả khoảnh khắc đã đánh dấu\n" +
                 "• Vuốt lên: chọn thời lượng lưu (15/30/60/90s)\n" +
                 "• Vuốt xuống: dính bong bóng vào cạnh màn hình\n" +
-                "• Kéo chậm: di chuyển bong bóng tránh đè nút/tướng\n\n" +
-                "(Lưu ý: phải NHẤN GIỮ ~0.5s rồi mới kéo thì mới di chuyển được bong bóng; " +
-                "chạm rồi vuốt ngay sẽ toả ra menu 4 hướng, di chuyển tay để chọn rồi nhấc tay để chốt.)\n\n" +
+                "• Nhấn giữ ~0.5s rồi kéo: di chuyển bong bóng\n\n" +
                 "Video chỉ được lưu khi bạn vuốt phải để dừng quay — vào Movies/GameReplay."
             setPadding(0, 32, 0, 0)
         }
 
         root.addView(title)
-        root.addView(overlayBtn)
-        root.addView(bubbleBtn)
-        root.addView(stopBtn)
+        root.addView(startBtn)
         root.addView(hint)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-        }
-
         return root
     }
 
-    private fun requestOverlayPermissionIfNeeded() {
+    private fun refreshButtonLabel() {
+        startBtn.text = if (Settings.canDrawOverlays(this))
+            "Mở bong bóng"
+        else
+            "1) Cấp quyền hiển thị nổi (overlay)"
+    }
+
+    private fun onStartClicked() {
         if (!Settings.canDrawOverlays(this)) {
-            // Targeting this app's own package URI is the most direct API
-            // Android offers — it opens this app's toggle screen, not a
-            // browsable list. Some OEM ROMs (MIUI/HyperOS in particular)
-            // override this system screen with their own permission list;
-            // that substitution happens outside the app and can't be
-            // bypassed from here.
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName")
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
             )
-            startActivity(intent)
-        } else {
-            Toast.makeText(this, "Đã có quyền overlay", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun showBubbleOnly() {
-        if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "Cấp quyền overlay trước (bước 1)", Toast.LENGTH_SHORT).show()
             return
         }
-        if (ScreenCaptureService.isRunning) {
-            Toast.makeText(this, "Bong bóng đã hiện rồi", Toast.LENGTH_SHORT).show()
-            return
-        }
-        ContextCompat.startForegroundService(this, Intent(this, ScreenCaptureService::class.java))
-        Toast.makeText(
+        // Permission already granted: show the bubble and get out of the way.
+        ContextCompat.startForegroundService(
             this,
-            "Bong bóng đã hiện — vào game rồi chạm để xin quyền quay & bắt đầu",
-            Toast.LENGTH_LONG
-        ).show()
-    }
-
-    private fun stopCapture() {
-        stopService(Intent(this, ScreenCaptureService::class.java))
-        Toast.makeText(this, "Đã dừng quay", Toast.LENGTH_SHORT).show()
+            Intent(this, ScreenCaptureService::class.java).apply {
+                action = ScreenCaptureService.ACTION_SHOW_BUBBLE
+            }
+        )
+        Toast.makeText(this, "Bong bóng đã hiện", Toast.LENGTH_SHORT).show()
+        finish()
     }
 }
