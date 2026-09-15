@@ -24,11 +24,16 @@ Mỗi hành động có rung phản hồi riêng (1 rung ngắn = hành động 
 ngắn = đã đánh dấu, 1 rung dài = dừng quay) để không cần nhìn màn hình xác
 nhận.
 
-**Phân biệt "kéo" và "vuốt":** dựa vào vận tốc lúc nhấc tay (velocity) — kéo
-chậm để di chuyển bong bóng, vuốt nhanh (fling) theo 1 trong 4 hướng để kích
-hoạt cử chỉ tương ứng. Ngưỡng vận tốc và độ nhạy nằm ở đầu file
-`ScreenCaptureService.kt` (`FLING_VELOCITY_THRESHOLD`, `TAP_SLOP_PX`), có thể
-tinh chỉnh nếu thấy quá nhạy/không nhạy.
+**Phân biệt "kéo" và "vuốt":** dựa vào **có nhấn giữ trước hay không** — chạm
+và giữ yên khoảng ~0.5s (bong bóng rung nhẹ xác nhận "đã bắt"), rồi mới kéo
+thì bong bóng di chuyển theo tay. Nếu chạm và di chuyển ngay (không giữ yên
+trước) thì **toả ra menu cánh quạt 4 nút hướng** quanh bong bóng (trên/dưới/
+trái/phải) — di chuyển ngón tay qua lại giữa các hướng để đổi ý trước khi
+nhấc tay, nút đang được chọn sẽ sáng lên; nhấc tay ở đâu thì chốt hành động
+theo hướng đang sáng lúc đó (nhấc tay ở vùng giữa, chưa đủ xa hướng nào →
+tính là chạm). Ngưỡng thời gian giữ (`LONG_PRESS_MS`) và khoảng cách tối
+thiểu để tính là vuốt (`SWIPE_MIN_DISTANCE_DP`) nằm ở đầu file
+`ScreenCaptureService.kt`.
 
 ## Kiến trúc
 
@@ -44,6 +49,11 @@ Vuốt phải (dừng) -> MomentStore.exportAll(): đọc lại từng file tạ
 ```
 
 - `BubbleView.kt` — vẽ hình tròn bong bóng, đổi màu/icon theo trạng thái.
+- `PetalMenuView.kt` — menu cánh quạt 4 hướng, hiện ra ngay khi phát hiện
+  đang vuốt (trước khi nhấc tay), highlight hướng đang chọn theo vị trí ngón
+  tay hiện tại — cho phép đổi hướng giữa chừng mà không bị hiểu nhầm là kéo
+  bong bóng (2 trạng thái "đang kéo" và "đang chọn hướng vuốt" tách biệt
+  hoàn toàn ngay từ lúc nhận diện cử chỉ).
 - `RollingBuffer.kt` — hàng đợi frame đã encode trong RAM, cửa sổ thời gian
   có thể đổi động (theo lựa chọn 15/30/60/90s).
 - `MomentStore.kt` — dump khoảnh khắc ra file tạm lúc đánh dấu, batch-export

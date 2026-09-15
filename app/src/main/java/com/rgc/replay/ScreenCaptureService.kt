@@ -22,7 +22,6 @@ import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.Surface
-import android.view.VelocityTracker
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -66,8 +65,9 @@ class ScreenCaptureService : Service() {
         private val DURATION_OPTIONS_SEC = listOf(15L, 30L, 60L, 90L)
         private const val DEFAULT_DURATION_INDEX = 1 // 30s
 
-        private const val FLING_VELOCITY_THRESHOLD = 900f // px/sec
         private const val TAP_SLOP_PX = 16f
+        private const val LONG_PRESS_MS = 500L
+        private const val SWIPE_MIN_DISTANCE_DP = 24
 
         @Volatile
         var isRunning = false
@@ -99,13 +99,18 @@ class ScreenCaptureService : Service() {
     private var bubbleParams: WindowManager.LayoutParams? = null
     private var pickerView: LinearLayout? = null
     private var pickerParams: WindowManager.LayoutParams? = null
+    private var petalView: PetalMenuView? = null
+    private var petalParams: WindowManager.LayoutParams? = null
 
     // touch tracking
-    private var velocityTracker: VelocityTracker? = null
     private var downRawX = 0f
     private var downRawY = 0f
     private var downLayoutX = 0
     private var downLayoutY = 0
+    private var isDragMode = false
+    private var isSelectingGesture = false
+    private val longPressHandler = Handler(android.os.Looper.getMainLooper())
+    private var longPressRunnable: Runnable? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -460,6 +465,60 @@ class ScreenCaptureService : Service() {
     }
 
     // ---------------------------------------------------------------------
+    // Petal menu: shown the instant a swipe is detected, gives visual
+    // feedback for the currently-selected direction, lets the user change
+    // direction before releasing.
+    // ---------------------------------------------------------------------
+
+    private fun showPetalMenu() {
+        val wm = windowManager ?: return
+        val bp = bubbleParams ?: return
+        if (petalView != null) return
+
+        val view = PetalMenuView(this)
+        val menuSize = dp(PetalMenuView.SIZE_DP)
+        val bubbleSize = dp(BubbleView.SIZE_DP)
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            // Center the (larger) petal menu on the bubble's current center.
+            x = bp.x - (menuSize - bubbleSize) / 2
+            y = bp.y - (menuSize - bubbleSize) / 2
+        }
+
+        wm.addView(view, params)
+        petalView = view
+        petalParams = params
+    }
+
+    private fun updatePetalDirection(dx: Float, dy: Float) {
+        val swipeThresholdPx = dp(SWIPE_MIN_DISTANCE_DP)
+        val dir = if (maxOf(abs(dx), abs(dy)) < swipeThresholdPx) {
+            PetalMenuView.Direction.NONE
+        } else if (abs(dx) > abs(dy)) {
+            if (dx < 0) PetalMenuView.Direction.LEFT else PetalMenuView.Direction.RIGHT
+        } else {
+            if (dy < 0) PetalMenuView.Direction.UP else PetalMenuView.Direction.DOWN
+        }
+        petalView?.highlighted = dir
+    }
+
+    private fun currentPetalDirection(): PetalMenuView.Direction =
+        petalView?.highlighted ?: PetalMenuView.Direction.NONE
+
+    private fun hidePetalMenu() {
+        petalView?.let { windowManager?.removeView(it) }
+        petalView = null
+        petalParams = null
+    }
+
+    // ---------------------------------------------------------------------
     // Bubble view + gesture detection
     // ---------------------------------------------------------------------
 
@@ -501,51 +560,79 @@ class ScreenCaptureService : Service() {
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                velocityTracker?.recycle()
-                velocityTracker = VelocityTracker.obtain()
-                velocityTracker?.addMovement(event)
                 downRawX = event.rawX
                 downRawY = event.rawY
                 downLayoutX = params.x
                 downLayoutY = params.y
+                isDragMode = false
+                isSelectingGesture = false
+
+                // Only a sustained press (no swipe yet) arms drag mode.
+                longPressRunnable = Runnable {
+                    isDragMode = true
+                    vibrate(15) // subtle tick: "picked up", now draggable
+                }
+                longPressHandler.postDelayed(longPressRunnable!!, LONG_PRESS_MS)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                velocityTracker?.addMovement(event)
-                val dx = (event.rawX - downRawX).toInt()
-                val dy = (event.rawY - downRawY).toInt()
-                if (bubbleState != BubbleState.DOCKED) {
-                    params.x = downLayoutX + dx
-                    params.y = downLayoutY + dy
-                    wm.updateViewLayout(bubbleView, params)
-                }
-                return true
-            }
-            MotionEvent.ACTION_UP -> {
-                val vt = velocityTracker
-                vt?.addMovement(event)
-                vt?.computeCurrentVelocity(1000)
-                val vx = vt?.xVelocity ?: 0f
-                val vy = vt?.yVelocity ?: 0f
-                vt?.recycle()
-                velocityTracker = null
-
                 val dx = event.rawX - downRawX
                 val dy = event.rawY - downRawY
-                val moved = abs(dx) > TAP_SLOP_PX || abs(dy) > TAP_SLOP_PX
-                val speed = maxOf(abs(vx), abs(vy))
 
-                when {
-                    !moved -> onTap()
-                    speed > FLING_VELOCITY_THRESHOLD -> {
-                        if (abs(vx) > abs(vy)) {
-                            if (vx < 0) togglePauseResume() else stopSession()
-                        } else {
-                            if (vy < 0) togglePicker() else dock()
-                        }
+                if (isDragMode) {
+                    if (bubbleState != BubbleState.DOCKED) {
+                        params.x = downLayoutX + dx.toInt()
+                        params.y = downLayoutY + dy.toInt()
+                        wm.updateViewLayout(bubbleView, params)
                     }
-                    // else: was a slow drag — leave the bubble wherever it was moved to.
+                    return true
                 }
+
+                if (!isSelectingGesture) {
+                    // Any real movement before the long-press timer fires means
+                    // this is a swipe attempt, not a drag — cancel arming drag
+                    // mode and enter gesture-selection mode instead.
+                    if (abs(dx) > TAP_SLOP_PX || abs(dy) > TAP_SLOP_PX) {
+                        longPressRunnable?.let { longPressHandler.removeCallbacks(it) }
+                        isSelectingGesture = true
+                        showPetalMenu()
+                        vibrate(10)
+                    } else {
+                        return true
+                    }
+                }
+
+                // In gesture-selection mode: just update which petal is
+                // highlighted based on the current finger position — the
+                // bubble itself does NOT move, so this can never be mistaken
+                // for dragging. The user can freely change direction here.
+                updatePetalDirection(dx, dy)
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                longPressRunnable?.let { longPressHandler.removeCallbacks(it) }
+
+                if (isDragMode) {
+                    isDragMode = false
+                    return true
+                }
+
+                if (isSelectingGesture) {
+                    val dir = currentPetalDirection()
+                    hidePetalMenu()
+                    isSelectingGesture = false
+                    when (dir) {
+                        PetalMenuView.Direction.LEFT -> togglePauseResume()
+                        PetalMenuView.Direction.RIGHT -> stopSession()
+                        PetalMenuView.Direction.UP -> togglePicker()
+                        PetalMenuView.Direction.DOWN -> dock()
+                        PetalMenuView.Direction.NONE -> onTap() // released back in the dead zone
+                    }
+                    return true
+                }
+
+                // No drag armed, no gesture-selection entered: a plain tap.
+                onTap()
                 return true
             }
         }
@@ -594,7 +681,9 @@ class ScreenCaptureService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        longPressRunnable?.let { longPressHandler.removeCallbacks(it) }
         hidePicker()
+        hidePetalMenu()
         try {
             bubbleView?.let { windowManager?.removeView(it) }
         } catch (_: Exception) {}

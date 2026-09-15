@@ -80,6 +80,8 @@ class MainActivity : AppCompatActivity() {
                 "• Vuốt lên: chọn thời lượng lưu (15/30/60/90s)\n" +
                 "• Vuốt xuống: dính bong bóng vào cạnh màn hình\n" +
                 "• Kéo chậm: di chuyển bong bóng tránh đè nút/tướng\n\n" +
+                "(Lưu ý: phải NHẤN GIỮ ~0.5s rồi mới kéo thì mới di chuyển được bong bóng; " +
+                "chạm rồi vuốt ngay sẽ toả ra menu 4 hướng, di chuyển tay để chọn rồi nhấc tay để chốt.)\n\n" +
                 "Video chỉ được lưu khi bạn vuốt phải để dừng quay — vào Movies/GameReplay."
             setPadding(0, 32, 0, 0)
         }
