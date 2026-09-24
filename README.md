@@ -18,6 +18,12 @@ có hoạt động ổn định khi vào game full-screen (Liên Quân Mobile) h
 6. Quan sát ô đỏ "OVERLAY OK #..." — nếu số vẫn tăng và ô vẫn hiện trong lúc chơi,
    nghĩa là overlay hoạt động đúng ngay cả trong game full-screen.
    Có thể kéo thả ô này sang vị trí không che tầm nhìn.
+7. Bấm **4. Bắt đầu MediaProjection (test)** → hệ thống hỏi "Entire screen" hay
+   "Single app" → chọn 1 trong 2 → quay lại game, xem ô đỏ overlay còn hiện không.
+   Test lần lượt cả 2 lựa chọn (mỗi lần bấm "Dừng MediaProjection" trước khi test
+   lựa chọn kia) để xác định overlay mất ở trường hợp nào, hay mất ở cả hai.
+   Service này **chưa ghi/lưu hình gì cả** — chỉ tạo VirtualDisplay tối giản để
+   cô lập nguyên nhân mất overlay, tách biệt khỏi logic ghi hình thật.
 
 ## Build tự động
 
