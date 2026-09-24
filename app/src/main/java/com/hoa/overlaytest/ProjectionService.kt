@@ -11,7 +11,9 @@ import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.DisplayMetrics
 import androidx.core.app.NotificationCompat
 
@@ -62,6 +64,20 @@ class ProjectionService : Service() {
                 val projectionManager =
                     getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
+
+                // Bắt buộc từ Android 14+: phải đăng ký callback TRƯỚC khi
+                // gọi createVirtualDisplay(), nếu không sẽ ném IllegalStateException.
+                mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        super.onStop()
+                        android.util.Log.i("ProjectionService", "MediaProjection.onStop() — hệ thống đã dừng phiên chia sẻ")
+                        isRunning = false
+                        virtualDisplay?.release()
+                        imageReader?.close()
+                        stopSelf()
+                    }
+                }, Handler(Looper.getMainLooper()))
+
                 startVirtualDisplay()
                 isRunning = true
             } catch (e: Exception) {
