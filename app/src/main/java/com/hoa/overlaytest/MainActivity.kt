@@ -3,11 +3,11 @@ package com.hoa.overlaytest
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Button
+import android.widget.EditText
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -17,19 +17,20 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
     private lateinit var projectionStatus: TextView
+    private lateinit var inputSeconds: EditText
 
     private val projectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
-            val serviceIntent = Intent(this, ProjectionService::class.java).apply {
-                putExtra(ProjectionService.EXTRA_RESULT_CODE, result.resultCode)
-                putExtra(ProjectionService.EXTRA_RESULT_DATA, result.data)
+            val serviceIntent = Intent(this, RecordingService::class.java).apply {
+                action = RecordingService.ACTION_START
+                putExtra(RecordingService.EXTRA_RESULT_CODE, result.resultCode)
+                putExtra(RecordingService.EXTRA_RESULT_DATA, result.data)
             }
             ContextCompat.startForegroundService(this, serviceIntent)
-            projectionStatus.text = "MediaProjection: ĐANG CHẠY — quay lại game để kiểm tra overlay"
         } else {
-            projectionStatus.text = "MediaProjection: người dùng từ chối quyền"
+            projectionStatus.text = "Ghi hình: người dùng từ chối quyền chia sẻ màn hình"
         }
     }
 
@@ -39,6 +40,7 @@ class MainActivity : AppCompatActivity() {
 
         statusText = findViewById(R.id.statusText)
         projectionStatus = findViewById(R.id.projectionStatus)
+        inputSeconds = findViewById(R.id.inputSeconds)
 
         findViewById<Button>(R.id.btnRequestPermission).setOnClickListener {
             requestOverlayPermission()
@@ -61,33 +63,33 @@ class MainActivity : AppCompatActivity() {
         }
 
         findViewById<Button>(R.id.btnStartProjection).setOnClickListener {
-            getSharedPreferences("overlay_test_prefs", MODE_PRIVATE)
-                .edit().remove("last_projection_error").apply()
             val projectionManager =
                 getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
         }
 
+        findViewById<Button>(R.id.btnSimulateCapture).setOnClickListener {
+            val seconds = inputSeconds.text.toString().toIntOrNull() ?: 15
+            val intent = Intent(this, RecordingService::class.java).apply {
+                action = RecordingService.ACTION_EXPORT
+                putExtra(RecordingService.EXTRA_EXPORT_SECONDS, seconds)
+            }
+            startService(intent)
+            projectionStatus.text = "Đang cắt $seconds giây gần nhất... (kiểm tra lại sau vài giây)"
+        }
+
         findViewById<Button>(R.id.btnStopProjection).setOnClickListener {
-            stopService(Intent(this, ProjectionService::class.java))
-            projectionStatus.text = "MediaProjection: đã dừng"
+            val intent = Intent(this, RecordingService::class.java).apply {
+                action = RecordingService.ACTION_STOP
+            }
+            startService(intent)
         }
     }
 
     override fun onResume() {
         super.onResume()
         updateStatus()
-        if (ProjectionService.isRunning) {
-            projectionStatus.text = "MediaProjection: ĐANG CHẠY"
-        } else {
-            val lastError = getSharedPreferences("overlay_test_prefs", MODE_PRIVATE)
-                .getString("last_projection_error", null)
-            projectionStatus.text = if (lastError != null) {
-                "MediaProjection: đã bị KILL/lỗi.\nChi tiết: $lastError"
-            } else {
-                "MediaProjection: chưa chạy / đã dừng (chưa có lỗi ghi nhận)"
-            }
-        }
+        updateProjectionStatus()
     }
 
     private fun updateStatus() {
@@ -99,6 +101,19 @@ class MainActivity : AppCompatActivity() {
             append(if (canOverlay) "ĐÃ CẤP ✅" else "CHƯA CẤP ❌")
             append("\nBỏ giới hạn pin: ")
             append(if (ignoringBattery) "ĐÃ BẬT ✅" else "CHƯA BẬT ⚠️")
+        }
+    }
+
+    private fun updateProjectionStatus() {
+        projectionStatus.text = buildString {
+            append("Ghi hình: ")
+            append(if (RecordingService.isRunning) "ĐANG CHẠY ✅" else "chưa chạy / đã dừng")
+            RecordingService.lastExportPath?.let {
+                append("\nClip gần nhất đã xuất:\n$it")
+            }
+            RecordingService.lastError?.let {
+                append("\n\nLỗi gần nhất: $it")
+            }
         }
     }
 
