@@ -36,7 +36,16 @@ class ProjectionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        startForegroundWithNotification()
+        try {
+            startForegroundWithNotification()
+        } catch (e: Exception) {
+            android.util.Log.e("ProjectionService", "Lỗi khi startForeground", e)
+            getSharedPreferences("overlay_test_prefs", MODE_PRIVATE)
+                .edit()
+                .putString("last_projection_error", "startForeground crash: ${e.javaClass.simpleName}: ${e.message}")
+                .apply()
+            stopSelf()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -57,6 +66,10 @@ class ProjectionService : Service() {
                 isRunning = true
             } catch (e: Exception) {
                 android.util.Log.e("ProjectionService", "Lỗi khi tạo VirtualDisplay", e)
+                getSharedPreferences("overlay_test_prefs", MODE_PRIVATE)
+                    .edit()
+                    .putString("last_projection_error", "${e.javaClass.simpleName}: ${e.message}")
+                    .apply()
                 isRunning = false
                 stopSelf()
             }

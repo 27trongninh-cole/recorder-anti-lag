@@ -61,6 +61,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         findViewById<Button>(R.id.btnStartProjection).setOnClickListener {
+            getSharedPreferences("overlay_test_prefs", MODE_PRIVATE)
+                .edit().remove("last_projection_error").apply()
             val projectionManager =
                 getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
@@ -75,10 +77,16 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         updateStatus()
-        projectionStatus.text = if (ProjectionService.isRunning) {
-            "MediaProjection: ĐANG CHẠY"
+        if (ProjectionService.isRunning) {
+            projectionStatus.text = "MediaProjection: ĐANG CHẠY"
         } else {
-            "MediaProjection: chưa chạy / đã dừng / đã bị kill"
+            val lastError = getSharedPreferences("overlay_test_prefs", MODE_PRIVATE)
+                .getString("last_projection_error", null)
+            projectionStatus.text = if (lastError != null) {
+                "MediaProjection: đã bị KILL/lỗi.\nChi tiết: $lastError"
+            } else {
+                "MediaProjection: chưa chạy / đã dừng (chưa có lỗi ghi nhận)"
+            }
         }
     }
 
