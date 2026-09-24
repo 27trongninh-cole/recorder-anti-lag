@@ -49,21 +49,28 @@ class ProjectionService : Service() {
         }
 
         if (resultData != null) {
-            val projectionManager =
-                getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
-            startVirtualDisplay()
-            isRunning = true
+            try {
+                val projectionManager =
+                    getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
+                startVirtualDisplay()
+                isRunning = true
+            } catch (e: Exception) {
+                android.util.Log.e("ProjectionService", "Lỗi khi tạo VirtualDisplay", e)
+                isRunning = false
+                stopSelf()
+            }
         }
 
         return START_NOT_STICKY
     }
 
     private fun startVirtualDisplay() {
+        val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
+        val display = displayManager.getDisplay(android.view.Display.DEFAULT_DISPLAY)
         val metrics = DisplayMetrics()
-        val windowManager = getSystemService(WINDOW_SERVICE) as android.view.WindowManager
         @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealMetrics(metrics)
+        display.getRealMetrics(metrics)
 
         val width = metrics.widthPixels
         val height = metrics.heightPixels

@@ -75,6 +75,11 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         updateStatus()
+        projectionStatus.text = if (ProjectionService.isRunning) {
+            "MediaProjection: ĐANG CHẠY"
+        } else {
+            "MediaProjection: chưa chạy / đã dừng / đã bị kill"
+        }
     }
 
     private fun updateStatus() {
