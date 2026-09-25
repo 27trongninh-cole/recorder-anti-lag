@@ -19,9 +19,10 @@ có hoạt động ổn định khi vào game full-screen (Liên Quân Mobile) h
    nghĩa là overlay hoạt động đúng ngay cả trong game full-screen.
    Có thể kéo thả ô này sang vị trí không che tầm nhìn.
 7. Bấm **4. Bắt đầu ghi hình (buffer)** → hệ thống hỏi "Entire screen" hay
-   "Single app" → chọn 1 trong 2 (nên test cả 2). App sẽ mã hoá H.264 liên tục
-   bằng phần cứng (không copy raw frame qua CPU) và giữ khoảng 40 giây gần nhất
-   trong bộ nhớ (RAM), không ghi ra file liên tục.
+   "Single app" → **luôn chọn "Entire screen"**. "Single app" hiện không được
+   hỗ trợ trên nhiều bản Android 14+ khi capture chạy trong 1 service nền tách
+   biệt (lỗi `SecurityException` từ chính hệ thống, không phải lỗi code) — vì
+   mục đích ghi toàn bộ game nên không cần dùng "Single app".
 8. Vào game chơi thoải mái ít nhất 20-30 giây (kiểm tra xem có giật/lag không
    so với lúc chưa bật ghi hình).
 9. Bất kỳ lúc nào, quay lại app, nhập số giây N muốn cắt (mặc định 15), bấm

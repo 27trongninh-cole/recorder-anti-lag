@@ -46,15 +46,19 @@ class RecordingService : Service() {
         const val ACTION_START = "com.hoa.overlaytest.action.START"
         const val ACTION_EXPORT = "com.hoa.overlaytest.action.EXPORT"
         const val ACTION_STOP = "com.hoa.overlaytest.action.STOP"
+        const val ACTION_EXPORT_RESULT = "com.hoa.overlaytest.action.EXPORT_RESULT"
 
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
         const val EXTRA_EXPORT_SECONDS = "extra_export_seconds"
+        const val EXTRA_SUCCESS = "extra_success"
+        const val EXTRA_PATH = "extra_path"
+        const val EXTRA_ERROR = "extra_error"
 
         // Giữ buffer dài hơn N tối đa cho phép 1 chút để luôn có đủ dữ liệu cắt
         const val MAX_BUFFER_SECONDS = 40
         const val TARGET_LONG_SIDE_PX = 1280 // giảm độ phân giải để nhẹ tải encoder/GPU
-        const val BIT_RATE = 6_000_000
+        const val BIT_RATE = 8_000_000
         const val FRAME_RATE = 30
         const val I_FRAME_INTERVAL_SEC = 1 // keyframe mỗi giây -> cắt clip chính xác hơn
 
@@ -158,14 +162,18 @@ class RecordingService : Service() {
         @Suppress("DEPRECATION")
         display.getRealMetrics(metrics)
 
-        val realW = metrics.widthPixels
-        val realH = metrics.heightPixels
-        val longSide = maxOf(realW, realH).toDouble()
-        val scale = if (longSide > TARGET_LONG_SIDE_PX) TARGET_LONG_SIDE_PX / longSide else 1.0
+        // Luôn ép khung ghi hình theo tỷ lệ NGANG (game luôn chơi ở chế độ ngang),
+        // bất kể lúc bấm nút app đang ở chế độ dọc hay ngang. Nếu không ép thế này,
+        // VirtualDisplay sẽ giữ nguyên tỷ lệ lúc tạo (có thể là dọc), khiến nội dung
+        // game ngang bị bóp méo/dùng không hết độ phân giải khi hiển thị vào khung đó.
+        val longSidePx = maxOf(metrics.widthPixels, metrics.heightPixels)
+        val shortSidePx = minOf(metrics.widthPixels, metrics.heightPixels)
+
+        val scale = if (longSidePx > TARGET_LONG_SIDE_PX) TARGET_LONG_SIDE_PX.toDouble() / longSidePx else 1.0
 
         // MediaCodec yêu cầu kích thước chẵn
-        var w = (realW * scale).toInt()
-        var h = (realH * scale).toInt()
+        var w = (longSidePx * scale).toInt()
+        var h = (shortSidePx * scale).toInt()
         if (w % 2 != 0) w -= 1
         if (h % 2 != 0) h -= 1
         return Pair(w, h)
@@ -271,6 +279,7 @@ class RecordingService : Service() {
             format = outputFormat
             if (format == null || frameBuffer.isEmpty()) {
                 reportError("Chưa có dữ liệu để xuất (buffer rỗng hoặc chưa có format)", null)
+                sendExportResultBroadcast(false, null, lastError)
                 return
             }
             val newestPts = frameBuffer.last().presentationTimeUs
@@ -318,9 +327,21 @@ class RecordingService : Service() {
             lastExportPath = outFile.absolutePath
             lastError = null
             android.util.Log.i("RecordingService", "Xuất clip thành công: ${outFile.absolutePath}")
+            sendExportResultBroadcast(true, outFile.absolutePath, null)
         } catch (e: Exception) {
             reportError("Lỗi khi mux/xuất file", e)
+            sendExportResultBroadcast(false, null, lastError)
         }
+    }
+
+    private fun sendExportResultBroadcast(success: Boolean, path: String?, error: String?) {
+        val intent = Intent(ACTION_EXPORT_RESULT).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_SUCCESS, success)
+            putExtra(EXTRA_PATH, path)
+            putExtra(EXTRA_ERROR, error)
+        }
+        sendBroadcast(intent)
     }
 
     // ---------- Dừng & dọn dẹp ----------

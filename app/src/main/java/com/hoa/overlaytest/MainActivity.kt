@@ -1,8 +1,12 @@
 package com.hoa.overlaytest
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
@@ -18,6 +22,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var projectionStatus: TextView
     private lateinit var inputSeconds: EditText
+
+    private val exportResultReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            intent ?: return
+            val success = intent.getBooleanExtra(RecordingService.EXTRA_SUCCESS, false)
+            val path = intent.getStringExtra(RecordingService.EXTRA_PATH)
+            val error = intent.getStringExtra(RecordingService.EXTRA_ERROR)
+            projectionStatus.text = if (success) {
+                "Cắt clip THÀNH CÔNG ✅\nFile: $path"
+            } else {
+                "Cắt clip THẤT BẠI ❌\nLỗi: $error"
+            }
+        }
+    }
 
     private val projectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -90,6 +108,20 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         updateStatus()
         updateProjectionStatus()
+        val filter = IntentFilter(RecordingService.ACTION_EXPORT_RESULT)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(exportResultReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(exportResultReceiver, filter)
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        try {
+            unregisterReceiver(exportResultReceiver)
+        } catch (_: Exception) { }
     }
 
     private fun updateStatus() {
