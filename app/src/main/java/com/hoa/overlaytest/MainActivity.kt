@@ -1,11 +1,13 @@
 package com.hoa.overlaytest
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -17,6 +19,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -34,17 +37,31 @@ class MainActivity : AppCompatActivity() {
     private val logLines = ArrayDeque<String>()
     private val MAX_LOG_LINES = 60
 
+    private val audioPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (!granted) {
+            Toast.makeText(this, "Chưa cấp quyền ghi âm — audio matching sẽ không hoạt động", Toast.LENGTH_LONG).show()
+        }
+        launchScreenCapture()
+    }
+
     private val projectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
-            val serviceIntent = Intent(this, RecordingService::class.java).apply {
-                action = RecordingService.ACTION_START
-                putExtra(RecordingService.EXTRA_RESULT_CODE, result.resultCode)
-                putExtra(RecordingService.EXTRA_RESULT_DATA, result.data)
-                putExtra(RecordingService.EXTRA_HERO_FILE, selectedHeroFile)
+            try {
+                val serviceIntent = Intent(this, RecordingService::class.java).apply {
+                    action = RecordingService.ACTION_START
+                    putExtra(RecordingService.EXTRA_RESULT_CODE, result.resultCode)
+                    putExtra(RecordingService.EXTRA_RESULT_DATA, result.data)
+                    putExtra(RecordingService.EXTRA_HERO_FILE, selectedHeroFile)
+                }
+                ContextCompat.startForegroundService(this, serviceIntent)
+            } catch (e: Exception) {
+                Toast.makeText(this, "Lỗi khởi động service ghi hình: ${e.message}", Toast.LENGTH_LONG).show()
+                projectionStatus.text = "Lỗi khởi động service: ${e.javaClass.simpleName}: ${e.message}"
             }
-            ContextCompat.startForegroundService(this, serviceIntent)
         } else {
             projectionStatus.text = "Ghi hình: người dùng từ chối quyền chia sẻ màn hình"
         }
@@ -106,9 +123,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         findViewById<Button>(R.id.btnStartProjection).setOnClickListener {
-            val projectionManager =
-                getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            } else {
+                launchScreenCapture()
+            }
         }
 
         findViewById<Button>(R.id.btnSimulateCapture).setOnClickListener {
@@ -131,6 +152,17 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnCopyLog).setOnClickListener {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("detection_log", detectionLog.text.toString()))
+        }
+    }
+
+    private fun launchScreenCapture() {
+        try {
+            val projectionManager =
+                getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+        } catch (e: Exception) {
+            Toast.makeText(this, "Lỗi mở Screen Capture: ${e.javaClass.simpleName}: ${e.message}", Toast.LENGTH_LONG).show()
+            projectionStatus.text = "Lỗi mở Screen Capture: ${e.javaClass.simpleName}: ${e.message}"
         }
     }
 
