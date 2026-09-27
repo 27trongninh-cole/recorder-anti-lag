@@ -7,10 +7,16 @@ import android.app.Service
 import android.content.Intent
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import android.media.AudioAttributes
+import android.media.Image
+import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -27,6 +33,8 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import android.graphics.Bitmap
+import android.graphics.Rect
 
 /**
  * Service ghi hình dạng "circular buffer": mã hoá H.264 liên tục bằng
@@ -47,6 +55,7 @@ class RecordingService : Service() {
         const val ACTION_EXPORT = "com.hoa.overlaytest.action.EXPORT"
         const val ACTION_STOP = "com.hoa.overlaytest.action.STOP"
         const val ACTION_EXPORT_RESULT = "com.hoa.overlaytest.action.EXPORT_RESULT"
+        const val ACTION_DETECTION_LOG = "com.hoa.overlaytest.action.DETECTION_LOG"
 
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
@@ -54,11 +63,20 @@ class RecordingService : Service() {
         const val EXTRA_SUCCESS = "extra_success"
         const val EXTRA_PATH = "extra_path"
         const val EXTRA_ERROR = "extra_error"
+        const val EXTRA_HERO_FILE = "extra_hero_file"
+        const val EXTRA_LOG_MESSAGE = "extra_log_message"
+
+        const val ANALYSIS_LONG_SIDE_PX = 960 // độ phân giải nhẹ cho OCR/avatar, không cần cao như file ghi hình
+        const val AUTO_EXPORT_SECONDS = 15
+        const val AUTO_EXPORT_COOLDOWN_MS = 5000L
+        const val OCR_THROTTLE_MS = 400L
+        const val AUDIO_CHECK_INTERVAL_MS = 300L
+        const val AUDIO_ROLLING_WINDOW_SEC = 3
 
         // Giữ buffer dài hơn N tối đa cho phép 1 chút để luôn có đủ dữ liệu cắt
         const val MAX_BUFFER_SECONDS = 40
-        const val TARGET_LONG_SIDE_PX = 1280 // giảm độ phân giải để nhẹ tải encoder/GPU
-        const val BIT_RATE = 8_000_000
+        const val TARGET_LONG_SIDE_PX = 1920 // gần độ phân giải gốc máy hơn, vẫn nhẹ vì encode bằng phần cứng
+        const val BIT_RATE = 14_000_000
         const val FRAME_RATE = 30
         const val I_FRAME_INTERVAL_SEC = 1 // keyframe mỗi giây -> cắt clip chính xác hơn
 
@@ -83,6 +101,24 @@ class RecordingService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var encoder: MediaCodec? = null
+
+    // --- Phân tích (OCR + avatar) ---
+    private var analysisVirtualDisplay: VirtualDisplay? = null
+    private var analysisImageReader: ImageReader? = null
+    private var analysisThread: HandlerThread? = null
+    private var analysisHandler: Handler? = null
+    @Volatile private var lastOcrProcessTime = 0L
+    private var heroReferences: List<AvatarMatcher.ReferenceAvatar> = emptyList()
+    private var myHeroName: String? = null
+
+    // --- Audio matching ---
+    private var audioReferences: List<AudioMatcher.ReferenceClip> = emptyList()
+    private var audioRecord: AudioRecord? = null
+    private var audioThread: HandlerThread? = null
+    @Volatile private var audioCapturing = false
+    private val lastAudioTriggerTime = mutableMapOf<String, Long>()
+
+    @Volatile private var lastAutoExportTime = 0L
 
     private var drainThread: HandlerThread? = null
     private var drainHandler: Handler? = null
@@ -146,6 +182,10 @@ class RecordingService : Service() {
             }, Handler(Looper.getMainLooper()))
 
             startEncoderAndVirtualDisplay()
+            OcrAnalyzer.loadKeywords(assets)
+            loadReferences(intent.getStringExtra(EXTRA_HERO_FILE))
+            startAnalysisPipeline()
+            startAudioCapture()
             isRunning = true
             lastError = null
         } catch (e: Exception) {
@@ -155,23 +195,22 @@ class RecordingService : Service() {
         }
     }
 
-    private fun computeTargetSize(): Pair<Int, Int> {
+    private fun computeTargetSize(): Pair<Int, Int> = computeSizeForLongSide(TARGET_LONG_SIDE_PX)
+
+    private fun computeSizeForLongSide(targetLongSide: Int): Pair<Int, Int> {
         val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
         val display = displayManager.getDisplay(android.view.Display.DEFAULT_DISPLAY)
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         display.getRealMetrics(metrics)
 
-        // Luôn ép khung ghi hình theo tỷ lệ NGANG (game luôn chơi ở chế độ ngang),
-        // bất kể lúc bấm nút app đang ở chế độ dọc hay ngang. Nếu không ép thế này,
-        // VirtualDisplay sẽ giữ nguyên tỷ lệ lúc tạo (có thể là dọc), khiến nội dung
-        // game ngang bị bóp méo/dùng không hết độ phân giải khi hiển thị vào khung đó.
+        // Luôn ép khung theo tỷ lệ NGANG (game luôn chơi ở chế độ ngang),
+        // bất kể lúc bấm nút app đang ở chế độ dọc hay ngang.
         val longSidePx = maxOf(metrics.widthPixels, metrics.heightPixels)
         val shortSidePx = minOf(metrics.widthPixels, metrics.heightPixels)
 
-        val scale = if (longSidePx > TARGET_LONG_SIDE_PX) TARGET_LONG_SIDE_PX.toDouble() / longSidePx else 1.0
+        val scale = if (longSidePx > targetLongSide) targetLongSide.toDouble() / longSidePx else 1.0
 
-        // MediaCodec yêu cầu kích thước chẵn
         var w = (longSidePx * scale).toInt()
         var h = (shortSidePx * scale).toInt()
         if (w % 2 != 0) w -= 1
@@ -190,6 +229,7 @@ class RecordingService : Service() {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE)
+            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
             setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL_SEC)
         }
@@ -344,6 +384,243 @@ class RecordingService : Service() {
         sendBroadcast(intent)
     }
 
+    // ---------- Nạp dữ liệu tham chiếu (avatar + audio mẫu) ----------
+
+    private fun loadReferences(heroFileExtra: String?) {
+        myHeroName = heroFileExtra
+        val refs = mutableListOf<AvatarMatcher.ReferenceAvatar>()
+        try {
+            val files = assets.list("avatars")?.filter {
+                it.endsWith(".png", true) || it.endsWith(".jpg", true) || it.endsWith(".jpeg", true)
+            } ?: emptyList()
+            for (fileName in files) {
+                assets.open("avatars/$fileName").use { input ->
+                    val bmp = android.graphics.BitmapFactory.decodeStream(input)
+                    if (bmp != null) {
+                        refs.add(AvatarMatcher.buildReference(fileName, bmp))
+                    }
+                }
+            }
+            sendLog("Đã nạp ${refs.size} avatar tham chiếu: ${refs.joinToString { it.name }}")
+        } catch (e: Exception) {
+            sendLog("Lỗi nạp avatar tham chiếu: ${e.message}")
+        }
+        heroReferences = refs
+
+        val audioRefs = mutableListOf<AudioMatcher.ReferenceClip>()
+        try {
+            val files = assets.list("audio_samples")?.filter { it.endsWith(".wav", true) } ?: emptyList()
+            for (fileName in files) {
+                assets.open("audio_samples/$fileName").use { input ->
+                    AudioMatcher.loadWavReference(fileName, input)?.let { audioRefs.add(it) }
+                }
+            }
+            sendLog("Đã nạp ${audioRefs.size} audio mẫu: ${audioRefs.joinToString { it.name }}")
+        } catch (e: Exception) {
+            sendLog("Lỗi nạp audio mẫu: ${e.message}")
+        }
+        audioReferences = audioRefs
+    }
+
+    // ---------- Pipeline phân tích: OCR + avatar matching ----------
+
+    private fun startAnalysisPipeline() {
+        if (heroReferences.isEmpty()) {
+            sendLog("Không có avatar tham chiếu nào — bỏ qua bước avatar matching")
+        }
+        val (w, h) = computeSizeForLongSide(ANALYSIS_LONG_SIDE_PX)
+        val metrics = DisplayMetrics()
+        val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
+        @Suppress("DEPRECATION")
+        displayManager.getDisplay(android.view.Display.DEFAULT_DISPLAY).getRealMetrics(metrics)
+
+        analysisThread = HandlerThread("AnalysisThread", Process.THREAD_PRIORITY_BACKGROUND).apply { start() }
+        analysisHandler = Handler(analysisThread!!.looper)
+
+        analysisImageReader = ImageReader.newInstance(w, h, android.graphics.PixelFormat.RGBA_8888, 2)
+        analysisImageReader?.setOnImageAvailableListener({ reader ->
+            val image = try { reader.acquireLatestImage() } catch (e: Exception) { null }
+            if (image == null) return@setOnImageAvailableListener
+            try {
+                val now = System.currentTimeMillis()
+                if (now - lastOcrProcessTime >= OCR_THROTTLE_MS) {
+                    lastOcrProcessTime = now
+                    val bitmap = imageToBitmap(image)
+                    if (bitmap != null) processAnalysisFrame(bitmap)
+                }
+            } catch (e: Exception) {
+                sendLog("Lỗi xử lý frame phân tích: ${e.message}")
+            } finally {
+                image.close()
+            }
+        }, analysisHandler)
+
+        analysisVirtualDisplay = mediaProjection?.createVirtualDisplay(
+            "OverlayTestAnalysis",
+            w, h, metrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            analysisImageReader?.surface,
+            null, null
+        )
+        sendLog("Bắt đầu phân tích OCR ở độ phân giải ${w}x${h}")
+    }
+
+    private fun imageToBitmap(image: Image): Bitmap? {
+        val plane = image.planes.getOrNull(0) ?: return null
+        val buffer = plane.buffer
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        val rowPadding = rowStride - pixelStride * image.width
+
+        val bitmap = Bitmap.createBitmap(
+            image.width + rowPadding / pixelStride,
+            image.height,
+            Bitmap.Config.ARGB_8888
+        )
+        bitmap.copyPixelsFromBuffer(buffer)
+        return if (rowPadding == 0) bitmap else Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
+    }
+
+    private fun processAnalysisFrame(bitmap: Bitmap) {
+        val events = OcrAnalyzer.analyze(bitmap)
+        for (event in events) {
+            val region = clampRect(event.avatarLeftRegion, bitmap.width, bitmap.height)
+            if (region.width() < 4 || region.height() < 4) continue
+            val crop = Bitmap.createBitmap(bitmap, region.left, region.top, region.width(), region.height())
+            val circular = AvatarMatcher.cropToCircle(crop)
+            val match = AvatarMatcher.findBestMatch(circular, heroReferences)
+
+            when {
+                match != null && match.first == myHeroName -> {
+                    sendLog("OCR '${event.keyword}' + avatar KHỚP tướng mình (${match.first}, dist=${match.second}) -> quay")
+                    triggerAutoExport("OCR+avatar: ${event.keyword} (${match.first})")
+                }
+                match != null && match.first != myHeroName -> {
+                    sendLog("OCR '${event.keyword}' + avatar khớp tướng KHÁC (${match.first}, dist=${match.second}) -> loại")
+                }
+                else -> {
+                    sendLog("OCR '${event.keyword}' nhưng KHÔNG nhận diện được avatar -> mặc định quay")
+                    triggerAutoExport("OCR (không rõ avatar): ${event.keyword}")
+                }
+            }
+        }
+    }
+
+    private fun clampRect(rect: Rect, maxW: Int, maxH: Int): Rect {
+        val left = rect.left.coerceIn(0, maxW - 1)
+        val top = rect.top.coerceIn(0, maxH - 1)
+        val right = rect.right.coerceIn(left + 1, maxW)
+        val bottom = rect.bottom.coerceIn(top + 1, maxH)
+        return Rect(left, top, right, bottom)
+    }
+
+    // ---------- Audio matching ----------
+
+    private fun startAudioCapture() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            sendLog("Audio capture cần Android 10+ — bỏ qua trên máy này")
+            return
+        }
+        if (audioReferences.isEmpty()) {
+            sendLog("Không có audio mẫu nào — bỏ qua bước audio matching")
+            return
+        }
+        val projection = mediaProjection ?: return
+
+        try {
+            val config = AudioPlaybackCaptureConfiguration.Builder(projection)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                .build()
+
+            val sampleRate = 44100
+            val audioFormat = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(sampleRate)
+                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                .build()
+
+            val minBufSize = AudioRecord.getMinBufferSize(
+                sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(4096)
+
+            audioRecord = AudioRecord.Builder()
+                .setAudioFormat(audioFormat)
+                .setBufferSizeInBytes(minBufSize * 4)
+                .setAudioPlaybackCaptureConfig(config)
+                .build()
+
+            audioRecord?.startRecording()
+            audioCapturing = true
+
+            audioThread = HandlerThread("AudioMatchThread", Process.THREAD_PRIORITY_BACKGROUND).apply { start() }
+            Handler(audioThread!!.looper).post { audioCaptureLoop(sampleRate) }
+
+            sendLog("Bắt đầu audio capture (${audioReferences.size} mẫu)")
+        } catch (e: Exception) {
+            sendLog("Lỗi khởi động audio capture: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    private fun audioCaptureLoop(sampleRate: Int) {
+        val rollingWindowSamples = sampleRate * AUDIO_ROLLING_WINDOW_SEC
+        val rolling = ShortArray(rollingWindowSamples)
+        val readChunk = ShortArray(sampleRate / 5) // ~200ms mỗi lần đọc
+        var lastCheck = 0L
+
+        while (audioCapturing) {
+            val record = audioRecord ?: break
+            val n = try {
+                record.read(readChunk, 0, readChunk.size)
+            } catch (e: Exception) {
+                sendLog("Lỗi đọc audio: ${e.message}")
+                break
+            }
+            if (n > 0) {
+                // dịch cửa sổ trượt: bỏ n mẫu cũ nhất, thêm n mẫu mới vào cuối
+                System.arraycopy(rolling, n, rolling, 0, rolling.size - n)
+                System.arraycopy(readChunk, 0, rolling, rolling.size - n, n)
+            }
+
+            val now = System.currentTimeMillis()
+            if (now - lastCheck >= AUDIO_CHECK_INTERVAL_MS) {
+                lastCheck = now
+                val liveEnvelope = AudioMatcher.computeEnvelope(rolling, sampleRate)
+                for (ref in audioReferences) {
+                    val score = AudioMatcher.bestCorrelation(liveEnvelope, ref.envelope)
+                    if (score >= AudioMatcher.MATCH_THRESHOLD) {
+                        val lastTrigger = lastAudioTriggerTime[ref.name] ?: 0L
+                        if (now - lastTrigger >= AUTO_EXPORT_COOLDOWN_MS) {
+                            lastAudioTriggerTime[ref.name] = now
+                            sendLog("Audio KHỚP '${ref.name}' (score=${"%.2f".format(score)}) -> quay")
+                            triggerAutoExport("Audio: ${ref.name}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- Trigger tự động cắt clip ----------
+
+    private fun triggerAutoExport(reason: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastAutoExportTime < AUTO_EXPORT_COOLDOWN_MS) return
+        lastAutoExportTime = now
+        sendLog("--> Tự động cắt clip: $reason")
+        exportHandler?.post { exportLastNSeconds(AUTO_EXPORT_SECONDS) }
+    }
+
+    private fun sendLog(message: String) {
+        android.util.Log.i("RecordingService", message)
+        val intent = Intent(ACTION_DETECTION_LOG).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_LOG_MESSAGE, message)
+        }
+        sendBroadcast(intent)
+    }
+
     // ---------- Dừng & dọn dẹp ----------
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -361,6 +638,24 @@ class RecordingService : Service() {
         drainThread?.quitSafely()
         drainThread = null
         drainHandler = null
+
+        analysisImageReader?.setOnImageAvailableListener(null, null)
+        analysisVirtualDisplay?.release()
+        analysisVirtualDisplay = null
+        analysisImageReader?.close()
+        analysisImageReader = null
+        analysisThread?.quitSafely()
+        analysisThread = null
+        analysisHandler = null
+
+        audioCapturing = false
+        try {
+            audioRecord?.stop()
+        } catch (_: Exception) { }
+        audioRecord?.release()
+        audioRecord = null
+        audioThread?.quitSafely()
+        audioThread = null
 
         virtualDisplay?.release()
         virtualDisplay = null

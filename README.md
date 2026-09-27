@@ -34,10 +34,33 @@ có hoạt động ổn định khi vào game full-screen (Liên Quân Mobile) h
     ở đoạn nào không.
 11. Bấm **Dừng ghi hình** khi test xong.
 
+## Test tính năng phát hiện tự động (audio + OCR + avatar)
+
+Xem chi tiết thiết kế đầy đủ trong `DESIGN.md`. Để test:
+
+1. Đặt 2-3 ảnh avatar tướng vào `app/src/main/assets/avatars/` (xem README
+   trong thư mục đó) và 1-2 file `.wav` vào `app/src/main/assets/audio_samples/`.
+   Sửa `app/src/main/assets/keywords.txt` nếu muốn thêm/bớt chữ HUD cần nhận
+   diện (mỗi dòng 1 chữ/cụm chữ, không cần sửa code Kotlin).
+2. Push code, tải APK release mới.
+3. Trong app: bấm chọn 1 nút tướng ở khu "Chọn tướng đang chơi" (đây là
+   tướng bạn coi là "của mình" trong lần test này).
+4. Bấm **4. Bắt đầu ghi hình + phát hiện tự động** → chọn Entire screen.
+5. Vào game, chơi và để ý khu **"Log phát hiện"** trong app — mỗi khi audio
+   hoặc OCR/avatar khớp gì đó, dòng log mới sẽ hiện realtime, kèm quyết định
+   (quay / loại / mặc định quay) và có tự động cắt clip hay không.
+6. Khi có dòng log "--> Tự động cắt clip", đợi vài giây rồi xem trạng thái
+   "Ghi hình" để lấy đường dẫn file.
+
+Lưu ý: đây là bản test đầu tiên — ngưỡng so khớp (`AvatarMatcher.MATCH_THRESHOLD`,
+`AudioMatcher.MATCH_THRESHOLD`) có thể cần tinh chỉnh sau khi xem log thực tế
+(khớp nhầm nhiều → tăng ngưỡng chặt hơn; bỏ sót nhiều → nới lỏng ngưỡng).
+
 ## Vị trí file clip xuất ra
 
 `Android/data/com.hoa.overlaytest/files/Movies/clip_<ngày giờ>.mp4`
 (đường dẫn chính xác hiện ngay trong app sau khi cắt xong)
+
 
 ## Build tự động
 

@@ -1,0 +1,19 @@
+# Mỗi dòng 1 chữ/cụm chữ cần OCR nhận diện trên HUD (không phân biệt hoa thường).
+# Dòng bắt đầu bằng # là comment, bị bỏ qua.
+# Thêm/sửa/xoá dòng tuỳ ý theo chữ thật xuất hiện trong game — không cần sửa code Kotlin.
+
+kill
+hạ
+double kill
+triple kill
+quad kill
+mega kill
+rampage
+unstoppable
+godlike
+legendary
+first blood
+bloodbath
+aced
+executed
+onslaught
