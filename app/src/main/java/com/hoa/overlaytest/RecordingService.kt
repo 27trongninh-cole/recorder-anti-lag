@@ -181,17 +181,36 @@ class RecordingService : Service() {
                 }
             }, Handler(Looper.getMainLooper()))
 
+            // Phần CỐT LÕI: phải thành công, nếu lỗi thì dừng hẳn service
             startEncoderAndVirtualDisplay()
-            OcrAnalyzer.loadKeywords(assets)
-            loadReferences(intent.getStringExtra(EXTRA_HERO_FILE))
-            startAnalysisPipeline()
-            startAudioCapture()
             isRunning = true
             lastError = null
         } catch (e: Exception) {
-            reportError("Lỗi khi bắt đầu ghi hình", e)
+            reportError("Lỗi khi bắt đầu ghi hình (phần cốt lõi)", e)
             isRunning = false
             stopSelf()
+            return
+        }
+
+        // Phần PHỤ (OCR/avatar/audio): lỗi ở đây KHÔNG được làm dừng phần ghi
+        // hình chính đã chạy thành công ở trên — chỉ log lỗi và bỏ qua bước đó.
+        try {
+            OcrAnalyzer.loadKeywords(assets)
+            loadReferences(intent.getStringExtra(EXTRA_HERO_FILE))
+        } catch (e: Exception) {
+            reportError("Lỗi nạp dữ liệu tham chiếu (không ảnh hưởng ghi hình)", e)
+        }
+
+        try {
+            startAnalysisPipeline()
+        } catch (e: Exception) {
+            reportError("Lỗi khởi động OCR/avatar pipeline (không ảnh hưởng ghi hình)", e)
+        }
+
+        try {
+            startAudioCapture()
+        } catch (e: Exception) {
+            reportError("Lỗi khởi động audio capture (không ảnh hưởng ghi hình)", e)
         }
     }
 
