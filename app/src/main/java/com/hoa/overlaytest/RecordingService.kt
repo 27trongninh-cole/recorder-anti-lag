@@ -544,6 +544,14 @@ class RecordingService : Service() {
             sendLog("Không có audio mẫu nào — bỏ qua bước audio matching")
             return
         }
+        val hasPermission = androidx.core.content.ContextCompat.checkSelfPermission(
+            this, android.Manifest.permission.RECORD_AUDIO
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        sendLog("Kiểm tra quyền RECORD_AUDIO trước khi build AudioRecord: ${if (hasPermission) "ĐÃ CẤP" else "CHƯA CẤP"}")
+        if (!hasPermission) {
+            sendLog("Bỏ qua audio capture vì thiếu quyền RECORD_AUDIO")
+            return
+        }
         val projection = mediaProjection ?: return
 
         try {
