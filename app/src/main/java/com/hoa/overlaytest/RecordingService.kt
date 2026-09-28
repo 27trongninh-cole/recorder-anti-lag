@@ -103,8 +103,8 @@ class RecordingService : Service() {
     private var encoder: MediaCodec? = null
 
     // --- Phân tích (OCR + avatar) ---
-    private var analysisVirtualDisplay: VirtualDisplay? = null
-    private var analysisImageReader: ImageReader? = null
+    private var frameRouter: ScreenFrameRouter? = null
+    private val analysisBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     private var analysisThread: HandlerThread? = null
     private var analysisHandler: Handler? = null
     @Volatile private var lastOcrProcessTime = 0L
@@ -259,11 +259,24 @@ class RecordingService : Service() {
         codec.start()
         encoder = codec
 
+        // Android 14+: MediaProjection chỉ cho tạo ĐÚNG 1 VirtualDisplay. Nên đổ vào
+        // router (OpenGL), router chia frame: 1 nhánh cho encoder, 1 nhánh thu nhỏ cho OCR.
+        val (aw, ah) = computeSizeForLongSide(ANALYSIS_LONG_SIDE_PX)
+        val router = ScreenFrameRouter(
+            encoderSurface = inputSurface,
+            width = width, height = height,
+            analysisWidth = aw, analysisHeight = ah,
+            analysisIntervalMs = OCR_THROTTLE_MS,
+            onAnalysisFrame = { bmp -> dispatchAnalysisFrame(bmp) }
+        )
+        val routerSurface = router.start()
+        frameRouter = router
+
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "OverlayTestRecording",
             width, height, metrics.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            inputSurface,
+            routerSurface,
             null, null
         )
 
@@ -447,57 +460,28 @@ class RecordingService : Service() {
         if (heroReferences.isEmpty()) {
             sendLog("Không có avatar tham chiếu nào — bỏ qua bước avatar matching")
         }
-        val (w, h) = computeSizeForLongSide(ANALYSIS_LONG_SIDE_PX)
-        val metrics = DisplayMetrics()
-        val displayManager = getSystemService(DISPLAY_SERVICE) as DisplayManager
-        @Suppress("DEPRECATION")
-        displayManager.getDisplay(android.view.Display.DEFAULT_DISPLAY).getRealMetrics(metrics)
-
         analysisThread = HandlerThread("AnalysisThread", Process.THREAD_PRIORITY_BACKGROUND).apply { start() }
         analysisHandler = Handler(analysisThread!!.looper)
+        sendLog("Bắt đầu phân tích OCR (dùng chung 1 VirtualDisplay với ghi hình)")
+    }
 
-        analysisImageReader = ImageReader.newInstance(w, h, android.graphics.PixelFormat.RGBA_8888, 2)
-        analysisImageReader?.setOnImageAvailableListener({ reader ->
-            val image = try { reader.acquireLatestImage() } catch (e: Exception) { null }
-            if (image == null) return@setOnImageAvailableListener
+    /** Nhận frame thu nhỏ từ router (chạy trên thread GL) -> chuyển sang thread phân tích, bỏ frame nếu đang bận */
+    private fun dispatchAnalysisFrame(bitmap: Bitmap) {
+        val handler = analysisHandler
+        if (handler == null || !analysisBusy.compareAndSet(false, true)) {
+            bitmap.recycle()
+            return
+        }
+        handler.post {
             try {
-                val now = System.currentTimeMillis()
-                if (now - lastOcrProcessTime >= OCR_THROTTLE_MS) {
-                    lastOcrProcessTime = now
-                    val bitmap = imageToBitmap(image)
-                    if (bitmap != null) processAnalysisFrame(bitmap)
-                }
+                processAnalysisFrame(bitmap)
             } catch (e: Exception) {
                 sendLog("Lỗi xử lý frame phân tích: ${e.message}")
             } finally {
-                image.close()
+                analysisBusy.set(false)
+                bitmap.recycle()
             }
-        }, analysisHandler)
-
-        analysisVirtualDisplay = mediaProjection?.createVirtualDisplay(
-            "OverlayTestAnalysis",
-            w, h, metrics.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            analysisImageReader?.surface,
-            null, null
-        )
-        sendLog("Bắt đầu phân tích OCR ở độ phân giải ${w}x${h}")
-    }
-
-    private fun imageToBitmap(image: Image): Bitmap? {
-        val plane = image.planes.getOrNull(0) ?: return null
-        val buffer = plane.buffer
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * image.width
-
-        val bitmap = Bitmap.createBitmap(
-            image.width + rowPadding / pixelStride,
-            image.height,
-            Bitmap.Config.ARGB_8888
-        )
-        bitmap.copyPixelsFromBuffer(buffer)
-        return if (rowPadding == 0) bitmap else Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
+        }
     }
 
     private fun processAnalysisFrame(bitmap: Bitmap) {
@@ -666,11 +650,6 @@ class RecordingService : Service() {
         drainThread = null
         drainHandler = null
 
-        analysisImageReader?.setOnImageAvailableListener(null, null)
-        analysisVirtualDisplay?.release()
-        analysisVirtualDisplay = null
-        analysisImageReader?.close()
-        analysisImageReader = null
         analysisThread?.quitSafely()
         analysisThread = null
         analysisHandler = null
@@ -686,6 +665,8 @@ class RecordingService : Service() {
 
         virtualDisplay?.release()
         virtualDisplay = null
+        frameRouter?.release()
+        frameRouter = null
 
         try {
             encoder?.stop()
@@ -708,6 +689,7 @@ class RecordingService : Service() {
         val msg = if (e != null) "$context: ${e.javaClass.simpleName}: ${e.message}" else context
         android.util.Log.e("RecordingService", msg, e)
         lastError = msg
+        sendLog("LỖI: $msg")
     }
 
     private fun startForegroundWithNotification() {

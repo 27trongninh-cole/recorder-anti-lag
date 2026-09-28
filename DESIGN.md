@@ -71,3 +71,14 @@ quyết định.
 - Detection (audio + OCR + avatar): đang test với 2-3 avatar mẫu + 1-2 audio
   mẫu, xem `app/src/main/assets/avatars/README.md` và
   `app/src/main/assets/audio_samples/README.md` để biết cách nạp dữ liệu mẫu
+
+## Ghi chú kỹ thuật quan trọng (đã gặp khi test)
+
+- **Android 14+: mỗi MediaProjection chỉ được gọi `createVirtualDisplay()` 1 lần.**
+  Tạo VirtualDisplay thứ 2 sẽ ném SecurityException và có thể làm hỏng token
+  (kéo theo lỗi `could not register audio policy` khi bật audio capture).
+  Vì vậy chỉ có 1 VirtualDisplay, đổ vào `ScreenFrameRouter` (OpenGL) để chia
+  frame: 1 nhánh cho encoder, 1 nhánh thu nhỏ (960px) cho OCR/avatar.
+- Chọn "Single app" khi xin quyền chia sẻ màn hình gây SecurityException trên
+  Android 16 — luôn dùng "Entire screen".
+- Khung ghi hình luôn ép theo tỷ lệ ngang (game chơi ngang) để không bị méo.
